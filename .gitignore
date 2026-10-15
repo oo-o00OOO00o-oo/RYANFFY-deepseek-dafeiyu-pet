@@ -7,6 +7,9 @@ menu-debug.log
 dsh-debug.log
 *.probe-backup
 
+# 本地测试 / 排障脚本与截图（这台机器没有 F:\Codex\work，放这里）
+_work/
+
 # 虚拟环境
 .venv/
 

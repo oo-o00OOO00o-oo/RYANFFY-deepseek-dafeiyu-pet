@@ -39,7 +39,7 @@ from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice
                             QEventLoop, QSize, QFileInfo, QEvent, QAbstractNativeEventFilter,
                             QObject)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
-                           QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence)
+                           QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
@@ -858,6 +858,130 @@ def dsh_raise_window(hwnd=0):
         return bool(u32.IsWindowVisible(hwnd))
     except Exception:
         return False
+
+
+# ===== DSH 工作状态：读会话日志，实时显示"在干活 / 等你批准" =================
+# 数据源：DSH 每次会话写在 ~/.dsh/sessions/<工作区>/session-*/session.v4.jsonl.zstd
+# （zstd 压缩的 JSONL，一行一个事件，会话进行中实时追加）。zstandard 没装上 /
+# 文件读不动时整个功能自动闭嘴，不影响别的。
+DSH_SESSIONS_ROOT = os.path.join(os.path.expanduser("~"), ".dsh", "sessions")
+DSH_SESSION_FILE = "session.v4.jsonl.zstd"
+DSH_STATUS_POLL_MS = 2500     # 几秒看一眼（解压 ~1MB 只要几毫秒，放后台线程）
+DSH_STATE_TAIL = 400          # 只看日志末尾这么多行：状态全在最新事件里
+
+# 工具名 → 状态条上的人话（没在表里的按"在忙"处理）
+DSH_TOOL_CN = {
+    "pwsh": "在跑命令", "shell": "在跑命令", "cmd": "在跑命令",
+    "grep": "在找东西", "web_search": "在搜资料", "web_fetch": "在看网页",
+    "read": "在看文件", "write": "在写文件", "edit": "在改文件",
+    "todo_write": "在列计划", "send_meme": "在发表情包",
+    "job_output": "在看后台任务", "ask_user_question": "在等你回话",
+}
+
+_dsh_zstd_warned = False      # "没装 zstandard"只在排查日志里说一次
+
+
+def dsh_latest_session_file():
+    """~/.dsh/sessions 下最近写入的那个会话文件；没有返回 None。"""
+    newest = None
+    try:
+        for root, _dirs, files in os.walk(DSH_SESSIONS_ROOT):
+            if DSH_SESSION_FILE not in files:
+                continue
+            p = os.path.join(root, DSH_SESSION_FILE)
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if newest is None or m > newest[0]:
+                newest = (m, p)
+    except Exception:
+        return None
+    return newest[1] if newest else None
+
+
+def dsh_read_state(path):
+    """（后台线程里跑）把会话日志解出来，只看末尾那段：
+
+    返回 None = 读不了（没装 zstandard / 文件坏了），调用方当作"没这功能"。
+    否则 dict：
+      working   —— 有 turn/start 还没等到 turn/end（正在干活）
+      turn/step —— 当前第几轮 / 第几步
+      action    —— 最近一次工具调用的人话（"在跑命令"那种）
+      task      —— 最近一条用户消息（任务原话）
+      approval  —— 还没被 decided 掉的 approval/asked：{"id", "tool"} 或 None
+    """
+    global _dsh_zstd_warned
+    try:
+        import zstandard
+    except ImportError:
+        if not _dsh_zstd_warned:
+            _dsh_zstd_warned = True
+            dsh_debug("dsh状态条: 没装 zstandard，读不了会话日志，状态条一直不显示")
+        return None
+    try:
+        out = bytearray()
+        with open(path, "rb") as fh:
+            try:
+                with zstandard.ZstdDecompressor().stream_reader(fh) as r:
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        out += chunk
+            except Exception:
+                pass            # 文件还在写：最后一帧可能缺尾巴，用解出来的那部分就行
+        lines = out.decode("utf-8", "replace").splitlines()[-DSH_STATE_TAIL:]
+    except Exception:
+        return None
+
+    working = False
+    turn = 0
+    step = 0
+    action = ""
+    task = ""
+    approvals = {}              # id -> {"id", "tool"}；decided 了就摘掉
+    for ln in lines:
+        if '"type"' not in ln:
+            continue
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        t = obj.get("type")
+        d = obj.get("data") or {}
+        if t == "turn/start":
+            working = True
+            turn = d.get("turn") or turn
+            step = 0
+            action = ""
+            approvals.clear()   # 新一轮开始，上一轮残留的审批不算数
+        elif t == "turn/end":
+            working = False
+            step = 0
+            action = ""
+            approvals.clear()
+        elif t == "step/start":
+            step = d.get("step") or step
+        elif t == "tool/call":
+            action = DSH_TOOL_CN.get(d.get("name") or "", "在忙")
+        elif t == "user/message":
+            try:
+                parts = d.get("content") or []
+                text = "".join(p.get("text", "") for p in parts
+                               if isinstance(p, dict)).strip()
+                if text:
+                    task = text
+            except Exception:
+                pass
+        elif t == "approval/asked":
+            aid = d.get("id")
+            if aid:
+                approvals[aid] = {"id": aid, "tool": d.get("toolName") or ""}
+        elif t == "approval/decided":
+            approvals.pop(d.get("id"), None)
+    return {"working": working, "turn": turn, "step": step, "action": action,
+            "task": task, "approval": (list(approvals.values())[-1] if approvals else None)}
 
 
 # 双击之后留几秒"让位"：这几秒里的自言自语先憋着，别把刚弹出来的那一眼盖掉
@@ -4264,6 +4388,7 @@ class PetWindow(QWidget):
             "balance_source": "DeepSeek",
             "other_keys": [],
             "double_click": DOUBLE_CLICK_DEFAULT,     # 快速双击弹哪个窗口（余额/天气/在放什么/台词）
+            "dsh_status_on": True,      # 脚下的 DSH 工作状态条（干活中/等你批准；空闲和没开不显示）
             "custom_process_lines": {},
             "default_line_overrides": {},
             "custom_lines": {},
@@ -4607,6 +4732,19 @@ class PetWindow(QWidget):
         self.cdx_timer = QTimer(self)
         self.cdx_timer.timeout.connect(self.scan_codex_usage)
         self.cdx_timer.start(CODEX_SCAN_MS)
+
+        # DSH 工作状态条：贴在脚下的"干活中 / 等你点同意"，几秒看一次会话日志
+        # （解压放后台线程，不卡界面；空闲和 DSH 没开时整条藏着）
+        self._dsh_bar = None
+        self._dsh_queue = []           # 后台线程解析好的状态，等 UI 线程来取
+        self._dsh_busy = False         # 上一次还没读完就别再压一个线程
+        self._dsh_running = False      # 上一次看到的"DSH 在不在跑"
+        self._dsh_approval_seen = set()  # 冒过泡的审批 id（同一个审批只提醒一次）
+        if self.cfg.get("dsh_status_on", True):
+            self._dsh_bar = DshStatusBar(self)
+            self.dsh_timer = QTimer(self)
+            self.dsh_timer.timeout.connect(self.poll_dsh_status)
+            self.dsh_timer.start(DSH_STATUS_POLL_MS)
 
         # 有些窗口（比如 Codex）自己也置顶，会盖住桌宠：定期把自己顶到置顶层最前面（不抢焦点）
         self.top_timer = QTimer(self)
@@ -6906,6 +7044,7 @@ class PetWindow(QWidget):
     def tick(self):
         self.t += 1
         self._rice_tick()          # 白饭碗：拖着追 / 不拖抱着
+        self._dsh_bar_tick()       # DSH 状态条：贴脚下 / 收后台结果 / 自愈
 
         # 歌词换句的过渡动画：发现"该显示的那一句"变了就淡入淡出一下
         if self._music_playing() and self.music_lyrics and self._lyric_lines:
@@ -8200,6 +8339,105 @@ class PetWindow(QWidget):
         amount, tokens = codex_usage_cost(self._codex_tokens.get(turn))
         if tokens:
             self.say(f"上一轮 {self.agent_name} 消耗 ¥{amount:.4f}（{tokens / 1000:.1f}k token）")
+
+    # ---------- DSH 工作状态条 ----------
+    def poll_dsh_status(self):
+        """几秒一次：DSH 在跑就去读最新会话日志（解压放后台线程，不卡界面）。"""
+        if self._dsh_bar is None or self._dsh_busy:
+            return
+        try:
+            running = bool(dsh_probe().get("found"))
+        except Exception:
+            running = False
+        self._dsh_running = running
+        if not running:
+            self._apply_dsh_state(None)
+            return
+        path = dsh_latest_session_file()
+        if not path:
+            self._apply_dsh_state(None)
+            return
+        self._dsh_busy = True
+
+        def worker():
+            try:
+                self._dsh_queue.append(dsh_read_state(path))
+            except Exception:
+                self._dsh_queue.append(None)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _drain_dsh_queue(self):
+        """UI 线程来收后台线程的解析结果（每帧一次，列表平时是空的）。"""
+        while self._dsh_queue:
+            state = self._dsh_queue.pop(0)
+            self._dsh_busy = False
+            self._apply_dsh_state(state)
+
+    def _apply_dsh_state(self, state):
+        """按最新状态决定状态条显示什么 —— 空闲 / DSH 没开就整条藏起来。"""
+        bar = self._dsh_bar
+        if bar is None:
+            return
+        ap = (state or {}).get("approval")
+        if state and self._dsh_running and ap:
+            bar.set_state("❗ 等你点同意", "approval")
+            aid = ap.get("id")
+            if aid not in self._dsh_approval_seen:
+                self._dsh_approval_seen.add(aid)
+                if len(self._dsh_approval_seen) > 40:
+                    self._dsh_approval_seen = set(list(self._dsh_approval_seen)[-20:])
+                tool = ap.get("tool") or "一个操作"
+                self.say(f"DSH 那边有个「{tool}」在等你点头哦，不去看看吗",
+                         seconds=4.5, queue=True)
+        elif state and self._dsh_running and state.get("working"):
+            step = max(1, state.get("step") or 1)
+            action = state.get("action") or "在思考"
+            bar.set_state(f"🐋 干活中 · 第 {step} 步 · {action}", "working")
+        else:
+            bar.set_state("", "working")
+            if bar.isVisible():
+                bar.hide()
+            return
+        if self.isVisible() and not bar.isVisible():
+            bar.show()
+        self._dsh_bar_follow(snap=True)
+
+    def _dsh_bar_follow(self, snap=False):
+        """把状态条贴到桌宠脚下（居中）；脚下出了屏幕就顶到桌宠头上。"""
+        bar = self._dsh_bar
+        if bar is None or not bar.isVisible():
+            return
+        ax = self.x() + (self.width() - bar.width()) // 2
+        ay = self.y() + self.height() + 6
+        try:
+            geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+            ax = max(geo.left(), min(geo.right() - bar.width() + 1, ax))
+            if ay + bar.height() > geo.bottom():
+                ay = self.y() - bar.height() - 6
+        except Exception:
+            pass
+        if snap:
+            bar.move(ax, ay)
+        else:
+            cx, cy = bar.x(), bar.y()
+            if abs(ax - cx) > 2 or abs(ay - cy) > 2:
+                bar.move(int(cx + (ax - cx) * 0.4), int(cy + (ay - cy) * 0.4))
+
+    def _dsh_bar_tick(self):
+        """每帧一次：收后台解析结果；状态条贴着桌宠走；被系统藏了自己恢复。"""
+        if self._dsh_bar is None:
+            return
+        self._drain_dsh_queue()
+        bar = self._dsh_bar
+        if not self.isVisible() or not bar.has_state():
+            if bar.isVisible():
+                bar.hide()
+            return
+        if not bar.isVisible():
+            bar.show()                      # 自愈：开对话框时 Qt 会顺手把可见窗口藏掉
+        if self.t % 5 == 0:
+            bar.raise_()                    # 两个窗口都置顶，谁在上层得自己维持
+        self._dsh_bar_follow()
 
     def _build_quick_menu(self):
         """右键菜单（v1.1.0 起瘦身版）：**一条子菜单都没有**，全是点一下就走。
@@ -10461,6 +10699,8 @@ class PetWindow(QWidget):
             self.hide()
             if getattr(self, "_rice", None) is not None:
                 self._rice.hide()
+            if getattr(self, "_dsh_bar", None) is not None:
+                self._dsh_bar.hide()
         else:
             self.show()
             self.raise_()
@@ -10485,6 +10725,11 @@ class PetWindow(QWidget):
         if getattr(self, "_rice", None) is not None:
             try:
                 self._rice.close()
+            except Exception:
+                pass
+        if getattr(self, "_dsh_bar", None) is not None:
+            try:
+                self._dsh_bar.close()
             except Exception:
                 pass
         self.tray.hide()
@@ -10564,6 +10809,70 @@ class RiceBowl(QWidget):
         if ev.button() == Qt.MouseButton.LeftButton:
             self.dragging = False          # 松手 -> _rice_tick 把碗贴回桌宠手边
             ev.accept()
+
+
+# ===== DSH 状态条：贴在桌宠脚下的一条小胶囊 ================================
+class DshStatusBar(QWidget):
+    """DSH 工作状态的实时小条：
+
+    - 干活中   -> 「🐋 干活中 · 第 3 步 · 在跑命令」（几秒一刷）
+    - 等你批准 -> 「❗ 等你点同意」（同时桌宠冒泡提醒，见 _apply_dsh_state）
+    - 空闲 / DSH 没开 -> 整条藏着，不打扰
+
+    永远鼠标穿透：它只是给人看的，绝不挡点击。位置由 PetWindow._dsh_bar_follow
+    每帧贴到桌宠脚下，跟白饭碗一套思路。
+    """
+
+    H = 26                    # 条高（像素）
+
+    def __init__(self, pet):
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if pet.cfg.get("topmost", True):
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        super().__init__(None, flags)
+        self.pet = pet
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowTitle("大肥鱼-DSH状态条")
+        self._text = ""
+        self._kind = "working"          # working（深色）/ approval（红色）
+        self._font = QFont("Microsoft YaHei UI", 10)
+        self.setFixedSize(96, self.H)
+
+    def has_state(self):
+        return bool(self._text)
+
+    def set_state(self, text, kind):
+        if text == self._text and kind == self._kind:
+            return
+        self._text = text
+        self._kind = kind
+        if text:
+            fm = QFontMetrics(self._font)
+            w = fm.horizontalAdvance(text) + 28      # 左右各留 14
+            self.setFixedSize(max(96, w), self.H)
+        self.update()
+
+    def paintEvent(self, _ev):
+        if not self._text:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        if self._kind == "approval":
+            bg = QColor(120, 44, 44, 225)
+            edge = QColor(255, 120, 110, 200)
+        else:
+            bg = QColor(30, 34, 46, 215)
+            edge = QColor(255, 255, 255, 60)
+        p.setPen(QPen(edge, 1))
+        p.setBrush(bg)
+        p.drawRoundedRect(rect, self.H / 2 - 0.5, self.H / 2 - 0.5)
+        p.setFont(self._font)
+        p.setPen(QColor(245, 246, 250))
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
 
 
 def main():

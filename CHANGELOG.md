@@ -1,5 +1,39 @@
 # 更新日志
 
+## v1.1.6（未发布）
+
+### 桌宠脚下多了一条 DSH 工作状态条
+
+- DSH（DeepSeek Harness）正在干活时，桌宠脚底下会冒出一条小胶囊：
+  「🐋 干活中 · 第 3 步 · 在跑命令」，几秒刷一次；活干完自己消失。
+- DSH 弹出「要不要批准这个操作」在等你点时，条会变红显示「❗ 等你点同意」，
+  桌宠同时冒泡提醒你一声 —— DSH 最小化的时候审批卡住，再也不会没发现了。
+- DSH 没开、或者它闲着的时候，整条藏起来，不打扰。
+- 状态条永远鼠标穿透、不挡点击；跟着桌宠走，脚下贴到屏幕底边没地方时就顶到桌宠头上。
+- 不想用：`config.json` 里把 `"dsh_status_on"` 改成 `false`。
+
+- 实测：离屏回归 `_work/test_dsh_status.py`（23 项全过）——真实会话文件解析、
+  干活中 / 等批准 / 批准后 / 空闲四种状态、多会话目录挑最新、写到一半的压缩文件不炸、
+  两种样式渲染与配色（红底 vs 深底）逐一验过。
+- 实测：真机（2026-10-15 23:29 重启桌宠后）：DSH 干活时状态条出现在桌宠正下方
+  （窗口枚举 visible=True，横向居中、贴在桌宠底边下 6 像素）；那轮活干完后
+  2.5 秒内自己藏掉（visible=False）。真机渲染留档 `_work/shot_bar_real.png`。
+- 实测：真机渲染确认 emoji（🐋 / ❗）和中文字体显示正常（离屏渲染是方块，
+  是 offscreen 平台没有字体回退，不是 bug）。
+
+### 维护者相关（发版 / 仓库，不写进 Release 说明）
+
+- 数据源：`~/.dsh/sessions/**/session.v4.jsonl.zstd`（zstd 压缩的 JSONL，一行一事件），
+  每 2.5 秒读一次最新那份，解压放后台线程（约 1MB / 几毫秒），只看末尾 400 行。
+  没装 zstandard 或读不动时整个功能自动闭嘴，不影响别的。
+- 新依赖：`zstandard`（已写进 requirements.txt，已装进 .venv）。
+  发版打包时用 `桌宠.spec` 照常打，注意确认 zstandard 被收进去（它是二进制 wheel）。
+- 顺手修了个隐患：`requests` 之前不在 .venv 里，是靠用户级 PYTHONPATH
+  （应用商店 Python 的 site-packages）碰巧 import 到的；已补装进 .venv，
+  现在 `python -c "import requests"` 在 venv 里直接过。
+- `_work/` 是本地测试目录（这台机器没有 `F:\Codex\work`），已加 .gitignore。
+- 没加菜单项、没加设置页开关（主人没要）；开关只有 config.json 的 `dsh_status_on`。
+
 ## v1.1.5
 
 ### 设置窗口切页时，四个角不再闪一下直角
