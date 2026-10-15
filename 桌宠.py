@@ -10265,15 +10265,27 @@ class PetWindow(QWidget):
                   "normal": "我站在普通层，谁点谁在上面"}[layer])
 
     def _apply_layer(self):
-        """用 Win32 精确摆放层级：HWND_TOPMOST / HWND_BOTTOM / HWND_NOTOPMOST。"""
+        """用 Win32 精确摆放层级：HWND_TOPMOST / HWND_BOTTOM / HWND_NOTOPMOST。
+
+        饭碗和 DSH 状态条是跟着桌宠走的自家小窗，层级要跟桌宠一起摆 ——
+        它们的 Qt 置顶标志只在创建时读过一次，不走这里的话，开着桌宠切层级
+        它们要等重启才跟上。
+        """
         try:
             HWND_TOPMOST, HWND_NOTOPMOST, HWND_BOTTOM = -1, -2, 1
             SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
             after = {"top": HWND_TOPMOST, "bottom": HWND_BOTTOM,
                      "normal": HWND_NOTOPMOST}.get(self.layer, HWND_TOPMOST)
-            ctypes.windll.user32.SetWindowPos(
-                ctypes.c_void_p(int(self.winId())), ctypes.c_void_p(after),
-                0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            wins = [self, getattr(self, "_rice", None), getattr(self, "_dsh_bar", None)]
+            for w in wins:
+                if w is None:
+                    continue
+                try:
+                    ctypes.windll.user32.SetWindowPos(
+                        ctypes.c_void_p(int(w.winId())), ctypes.c_void_p(after),
+                        0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -10804,7 +10816,15 @@ class RiceBowl(QWidget):
 
     def mouseMoveEvent(self, ev):
         if self.dragging:
-            self.move(ev.globalPosition().toPoint() - self._off)
+            pos = ev.globalPosition().toPoint() - self._off
+            try:
+                # 拖着也不许出屏幕：拖出去松手才被锚点拉回，那一下"碗没了"很难看
+                geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+                pos.setX(max(geo.left(), min(geo.right() - self.width() + 1, pos.x())))
+                pos.setY(max(geo.top(), min(geo.bottom() - self.height() + 1, pos.y())))
+            except Exception:
+                pass
+            self.move(pos)
             ev.accept()
 
     def mouseReleaseEvent(self, ev):
