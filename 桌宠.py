@@ -6901,7 +6901,8 @@ class PetWindow(QWidget):
         三视图时按方向微调（主人逐条定下来的）：
           - 朝左 / 朝右：碗心在"精灵半个身位"的基础上**再往外三个碗宽**
             （`rice_side_extra`，默认 3；嫌远就改小）
-          - 朝前（正面，面对你）：**下降半个碗身**（`rice_front_drop`，默认 0.5）
+          - 朝前（正面，面对你）：**下降四分之一个碗身**（`rice_front_drop`，默认 0.25），
+            碗正好嵌进她捧着的手里（新待机形象是抱碗姿势；旧值 0.5 会落到围裙上）
           - 朝后（背影）：高度不变，**图层降到桌宠后面**（见 _rice_tick）
         单张形象（分不出方向）时不做任何方向偏移，就居中放在基准高度上。
 
@@ -6933,9 +6934,9 @@ class PetWindow(QWidget):
                 offset_x = -reach if dir_ == "left" else reach
             elif dir_ == "down":
                 try:
-                    drop = float(self.cfg.get("rice_front_drop", 0.5)) * bh
+                    drop = float(self.cfg.get("rice_front_drop", 0.25)) * bh
                 except Exception:
-                    drop = 0.5 * bh
+                    drop = 0.25 * bh
 
         ax = sprite_cx - bw * 0.5 + offset_x
         if three and dir_ == "up":
