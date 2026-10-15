@@ -1,0 +1,4 @@
+rice_bowl.png - 'Cooked rice' from Microsoft Fluent Emoji
+https://github.com/microsoft/fluentui-emoji
+License: MIT (Copyright (c) Microsoft Corporation)
+File: assets/Cooked rice/3D/cooked_rice_3d.png

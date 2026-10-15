@@ -1,0 +1,52 @@
+﻿大肥鱼桌宠（DeepSeek 大肥鱼桌宠）—— 源码版部署
+================================================
+
+来源   : https://github.com/RYANFFY/deepseek-dafeiyu-pet
+版本   : v1.1.5（官方 Release 的源码树，main 分支同版本）
+运行   : .venv\Scripts\pythonw.exe  +  桌宠.py（用 .venv 里的 PySide6 6.12）
+
+怎么启动
+--------
+双击桌面 / 开始菜单的「大肥鱼桌宠」快捷方式即可。
+（快捷方式指向 .venv\Scripts\pythonw.exe，参数是 "D:\大肥鱼桌宠\桌宠.py"；
+  也可以直接跑 启动桌宠.bat。）
+
+本机对源码做的改动（两处，合并成 3 个功能）
+-------------------------------------------
+1) 双击桌宠（原「快速双击」机制）新增一个选项「启动 DeepSeek Harness」：
+   - DSH 没在跑  -> 启动 D:\dsh\DeepSeek Harness.exe
+   - DSH 已经在跑 -> 把它的窗口从最小化 / 收进托盘的状态里捞回前台
+   - 捞不出来    -> 自动退回原来的「看一眼余额」
+   改了 桌宠.py 里的 DOUBLE_CLICK_CHOICES、_on_double_click，
+   并新增 dsh_is_running / dsh_pids / dsh_launch / dsh_focus_window 四个函数
+   （dsh_focus_window 用 ctypes 调 user32：EnumWindows + ShowWindow + SetForegroundWindow，
+     前台锁定拦不住时用 SwitchToThisWindow 兜底）。
+2) config.json 里 double_click 设为 "dsh"。
+
+想换回原来的双击行为
+--------------------
+右键桌宠 -> 快速双击 -> 选「看一眼余额 / 看一眼天气 / 看一眼在放什么 / 说一句我写的台词」。
+DSH 路径要改的话，在 config.json 里加一条 "dsh_path": "D:\\你的\\DeepSeek Harness.exe"。
+
+配置 / 数据
+-----------
+config.json / usage.json / lyrics_cache.json / app_time.json 都在本目录（源码版如此，
+打包版才放 %APPDATA%\大肥鱼桌宠）。旧的那份还留在 %APPDATA% 里当备份，删掉也不影响。
+config.json 里明文存着 DeepSeek API key，别把这个文件发给别人。
+
+依赖
+----
+PySide6 6.12 / requests 装在 .venv 里。
+winsdk（读 Windows 媒体会话，用于更准的歌词识别）在 Python 3.13 上没有轮子、
+编译不过，所以用了 pywinrt 的 winrt-Windows.Media.Control + 本目录下的 winsdk\ 转发垫片。
+垫片没生效时程序会自动退回「读播放器窗口标题」，功能不会坏。
+
+回滚到旧版
+----------
+旧版单文件版还在本目录：旧版单文件-v1.0.12.exe（双击即可运行）。
+要彻底回到旧版：把桌面/开始菜单快捷方式指回它，然后可以删掉 .venv 和源码文件。
+
+卸载
+----
+删掉整个 D:\大肥鱼桌宠 目录，再删掉桌面 / 开始菜单 / 启动文件夹里的快捷方式即可。
+（启动文件夹里那份是程序自己加的开机自启，也可以在 右键 -> 设置 -> 通用 里关掉。）

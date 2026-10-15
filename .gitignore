@@ -4,6 +4,7 @@ usage.json
 app_time.json
 lyrics_cache.json
 menu-debug.log
+dsh-debug.log
 *.probe-backup
 
 # 虚拟环境
