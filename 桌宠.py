@@ -6097,6 +6097,16 @@ class PetWindow(QWidget):
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
 
+    def _load_anxious_pixmap(self, h):
+        """追饭碗时的「着急」表情：sprites/着急.png（没有这张图就跳过，追逐时仍用方向图）。"""
+        sized = os.path.join(SPRITE_DIR, f"着急_{h}.png")
+        if os.path.exists(sized):
+            return QPixmap(sized)
+        base = self._view_base(os.path.join(SPRITE_DIR, "着急.png"))
+        if base is None:
+            return None
+        return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
+
     def _view_base(self, path):
         """某个视图"原图裁掉透明边"之后的那份，按「路径 + 修改时间」缓存。
 
@@ -6134,6 +6144,9 @@ class PetWindow(QWidget):
                 pix = self._load_view_pixmap(view, h)
                 if pix is not None and not pix.isNull():
                     self.sprites[(key, h)] = pix
+            anx = self._load_anxious_pixmap(h)      # 追饭碗的「着急」表情
+            if anx is not None and not anx.isNull():
+                self.sprites[("着急", h)] = anx
         self.widget_skin_ok = self._has_sprite("挂件")
 
     @staticmethod
@@ -6156,6 +6169,10 @@ class PetWindow(QWidget):
                 pix = self._load_view_pixmap(view, h)
                 if pix is not None and not pix.isNull():
                     self.sprites[(key, h)] = pix
+        if ("着急", h) not in self.sprites:
+            anx = self._load_anxious_pixmap(h)
+            if anx is not None and not anx.isNull():
+                self.sprites[("着急", h)] = anx
         self.widget_skin_ok = self._has_sprite("挂件")
 
     def _prune_sprites(self, keep_h):
@@ -6819,6 +6836,11 @@ class PetWindow(QWidget):
         if self.skin == SKIN_WIDGET:
             return ("挂件", self.cur_h,
                     self.facing if self.dir in ("left", "right") else 1)
+        # 追饭碗时换「着急」表情（sprites/着急.png；没这张图就用原来的方向图）
+        if (getattr(self, "_rice_chasing", False)
+                and ("着急", self.cur_h) in self.sprites):
+            return ("着急", self.cur_h,
+                    self.facing if self.dir in ("left", "right") else 1)
         name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
         return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
 
@@ -7007,6 +7029,8 @@ class PetWindow(QWidget):
                 pass
         if bowl.dragging:
             if not self._rice_chasing:
+                self.prev_key = self._sprite_key()   # 换「着急」表情也走淡入淡出
+                self.cross_t = 1.0
                 self._rice_chasing = True
                 self._rice_next_line = 0.0
             self.target = None
@@ -7037,6 +7061,8 @@ class PetWindow(QWidget):
             self.update()
         else:
             if self._rice_chasing:
+                self.prev_key = self._sprite_key()   # 从「着急」淡回平时那张
+                self.cross_t = 1.0
                 self._rice_chasing = False
                 self.cur_speed = 0.0
             self._rice_carry_update()
