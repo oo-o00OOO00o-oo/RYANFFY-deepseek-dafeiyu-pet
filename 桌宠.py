@@ -10626,13 +10626,15 @@ class PetWindow(QWidget):
                 # 上面那层是自家的饭碗就别动：它不是"压住我的别的窗口"，而是我要抱着的东西。
                 # 不加这个判断的话，每 2 秒就会把自己抬到饭碗上面一次（主人反馈
                 # "切换到小鲸鱼挂件形象后饭碗不见了"就是这个打架的表现）。
-                _bowl = getattr(self, "_rice", None)
-                if _bowl is not None:
-                    try:
-                        if int(above) == int(_bowl.winId()):
-                            return
-                    except Exception:
-                        pass
+                # DSH 状态条同理：它也是自家跟着走的小窗，_dsh_bar_tick 每 5 帧
+                # 抬它一次，这里不豁免的话两边会每 2 秒抢一次 Z 序。
+                for _own in (getattr(self, "_rice", None), getattr(self, "_dsh_bar", None)):
+                    if _own is not None:
+                        try:
+                            if int(above) == int(_own.winId()):
+                                return
+                        except Exception:
+                            pass
                 ex = user32.GetWindowLongPtrW(ctypes.c_void_p(above), GWL_EXSTYLE)
                 if not (int(ex) & WS_EX_TOPMOST):
                     return               # 上面那个不是置顶窗口 → 我们本来就是最上面的，不用动
