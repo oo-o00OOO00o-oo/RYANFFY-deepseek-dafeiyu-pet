@@ -281,6 +281,12 @@ LINE_FREQ_LEVELS = {
 LINE_FREQ_DEFAULT = "正常"
 SPEED = 380.0
 TICK = 20
+# 行走动画节奏：单腿一步 0.22 秒（shimeji / MikuPet 那套是 0.1~0.15s 一帧，
+# 我们两帧一轮，0.22s 一步在 20ms/40ms 两种帧率下都不闪也不拖）。
+# bob（上下颠簸）/ sway（左右摇摆）/ 换腿帧都锁相到这个频率：
+# sin(now*WALK_FREQ) 每过一次零 = 换一条腿，正好是 bob 落到最低点（脚踩地）。
+WALK_LEG_S = 0.22
+WALK_FREQ = math.pi / WALK_LEG_S
 # 「原地待着时也跟着鼠标转」的"鼠标贴身上"半径：鼠标在这个圈里就当正面（不左右转）
 STILL_FACE_NEAR = 70
 
@@ -6511,8 +6517,9 @@ class PetWindow(QWidget):
         cx = self.width() / 2
         walking = self.target is not None and not self.dragging
         if walking:
-            sway = math.sin(now * 9.0) * 3.5
-            bob = -abs(math.sin(now * 4.5)) * 7.0
+            # 摇摆按完整步态周期（两步一摇），颠簸和换腿同频：每步落地一次
+            sway = math.sin(now * WALK_FREQ / 2) * 3.0
+            bob = -abs(math.sin(now * WALK_FREQ)) * 5.0
         else:
             sway = math.sin(now * 2.5) * 1.5
             bob = 0.0
@@ -6870,7 +6877,8 @@ class PetWindow(QWidget):
 
         - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
         - 侧面 / 背面：行走时两帧轮换，节奏和上下颠簸（paintEvent 里的
-          bob = sin(now*4.5)）锁相 —— 一次颠簸迈一步，换腿正好踩在落脚点上
+          bob = -abs(sin(now*WALK_FREQ))）锁相 —— 每 0.22 秒迈一步，
+          换腿正好踩在落脚点上
         """
         now = self._secs()
         if name == "正面":
@@ -6879,7 +6887,7 @@ class PetWindow(QWidget):
         elif name in ("侧面", "背面"):
             walking = self.target is not None and not self.dragging
             alt = f"{name}-2"
-            if (walking and math.sin(now * 4.5) < 0
+            if (walking and math.sin(now * WALK_FREQ) < 0
                     and (alt, self.cur_h) in self.sprites):
                 return alt
         return name
@@ -6892,22 +6900,27 @@ class PetWindow(QWidget):
         if facing is not None and facing != self.facing:
             self.facing = facing
 
-    def _face_travel(self, dx, dy, ratio=2):
+    def _face_travel(self, dx, dy, ratio=1.2):
         """按"这一步往哪走"给朝向（dx/dy 是窗口中心 → 目标点的位移）。
 
-        明显横向（横向位移是纵向的 ratio 倍以上）→ 侧面（自动镜像）；
-        其余只要往上走 → 背影（等于往屏幕里走、背对着你）；往下走 → 正面。
+        规则（主人 2026-10-16 反馈"左右移动时有时候不会变成侧面图"后改的）：
+        **默认给侧面**（自动镜像），只有明显偏竖直才给背影（往上）/ 正面（往下）。
+        还带迟滞，边界附近不会来回闪：
 
-        以前这里是"只要横向超过 4px 就侧面，只有几乎笔直向上才给背影"，而散步的随机
-        目标几乎不可能笔直向上，于是背影再也没出现过（主人反馈"我这么久没见过背面"）。
-        阈值取 2 倍（不是对半分）是因为屏幕是宽屏：横向位移天然比纵向大一截，
-        真按 |dx|>=|dy| 分的话背影只占 1/7 左右（实机 90 秒一次都没出现）。
-        现在宽屏上大约 45% 侧面、25% 背影、30% 正面。
+          - 当前是侧面：纵向位移要到横向的 1.6 倍才转成正面/背影
+          - 当前是正面/背影：横向位移只要到纵向的 0.85 倍就转成侧面
 
-        ratio 只给"走路"用；跟着鼠标转头用的是 1（见 `_face_cursor`）——鼠标是看着走的，
-        45 度就该算侧面，不该按宽屏那套偏袒横向。
+        以前这里是"横向要到纵向 2 倍才给侧面"，宽屏上斜着走的散步目标大多落进
+        正面/背影区 —— 明明在往右走却顶着一张正脸（主人反馈）。
+        迟滞的另一面是保住了背影的出场率：宽屏随机散步下大约 55% 侧面、
+        20% 背影、25% 正面（实机盯着数过才调的）。
         """
-        if abs(dx) >= ratio * abs(dy):
+        ax, ay = abs(dx), abs(dy)
+        if self.dir in ("left", "right"):
+            vertical = ay >= ax * 1.6       # 已经侧着：要明显偏竖才转身
+        else:
+            vertical = ay >= ax * ratio     # 正/背面：横向一占上风就侧身
+        if not vertical:
             self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
         elif dy < 0:
             self._set_dir("up")
@@ -6943,7 +6956,8 @@ class PetWindow(QWidget):
             （`rice_side_extra`，默认 3；嫌远就改小）
           - 朝前（正面，面对你）：**下降四分之一个碗身**（`rice_front_drop`，默认 0.25），
             碗正好嵌进她捧着的手里（新待机形象是抱碗姿势；旧值 0.5 会落到围裙上）
-          - 朝后（背影）：高度不变，**图层降到桌宠后面**（见 _rice_tick）
+          - 朝后（背影）：收在身体正中、手的高度，**图层降到桌宠后面**（见 _rice_tick），
+            被身体整个挡住 —— 背影时碗是"抱在怀里"，不该顶在头上（主人反馈过）
         单张形象（分不出方向）时不做任何方向偏移，就居中放在基准高度上。
 
         **方向必须用 self.dir 判断，不能用 self.facing**：facing 是"要不要水平镜像"
@@ -6980,12 +6994,11 @@ class PetWindow(QWidget):
 
         ax = sprite_cx - bw * 0.5 + offset_x
         if three and dir_ == "up":
-            # 背影（走向屏幕里）：碗等于举在"更远的前方"，屏幕上就是桌宠头顶那一带；
-            # 图层又降到桌宠后面，于是鱼头只挡住碗的下半部分 —— 既满足"降一层"，
-            # 又不会被整只挡住看不见（主人反馈"形象切换就不显示图标"）。
-            # 露出大半个碗（0.65 个碗高在精灵顶边之上），只让鱼头挡住下沿 ——
-            # 原来写成 0.15，只露出 8px，等于还是被挡住看不见。
-            ay = (sprite_bottom - self.cur_h) - bh * 0.65
+            # 背影（走向屏幕里）：碗是"抱在怀里、背对着你"，就收在身体正中、
+            # 手的高度，图层降到桌宠后面（见 _rice_tick）—— 正好被身体整个挡住。
+            # 以前是举到头顶那一带露出大半个碗，主人反馈"往后走时白饭图标
+            # 显示在桌宠头顶"，像顶在头上，不对。
+            ay = sprite_bottom - bh * 1.95
         else:
             ay = sprite_bottom - bh * 1.95 + drop
         try:
