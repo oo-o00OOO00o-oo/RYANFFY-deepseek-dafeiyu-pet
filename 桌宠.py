@@ -1295,6 +1295,9 @@ VIEW_LABELS = {"front": "正面（朝屏幕下）", "side": "侧面（左右走�
                "back": "背面（朝屏幕上）", "widget": "小鲸鱼挂件"}
 # 短名字：菜单 / 对话框 / 冒泡里用得着（VIEW_LABELS 太长）
 VIEW_SHORT = {"front": "正面", "side": "侧面", "back": "背面", "widget": "挂件"}
+# 动画帧素材（缺哪张就自动退回对应的静态图，不报错）：
+#   正面-眨 —— 待机/正面行走时的眨眼帧；侧面-2 / 背面-2 —— 行走循环的第二帧
+ANIM_FRAMES = ("正面-眨", "侧面-2", "背面-2")
 
 # 打开的某些应用时冒泡吐槽（进程名小写）
 PROCESS_LINES = {
@@ -4509,6 +4512,9 @@ class PetWindow(QWidget):
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
+        # 眨眼动画（秒，走 _secs() 那条内部时钟）：到 _blink_until 为止显示闭眼帧
+        self._blink_until = 0.0
+        self._next_blink = 3.0
         self.dragging = False
         self._drag_blocked = False   # 锁定时按着划了一下（不算点击、也不挪窝）
         self.drag_offset = None
@@ -6097,15 +6103,20 @@ class PetWindow(QWidget):
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
 
-    def _load_anxious_pixmap(self, h):
-        """追饭碗时的「着急」表情：sprites/着急.png（没有这张图就跳过，追逐时仍用方向图）。"""
-        sized = os.path.join(SPRITE_DIR, f"着急_{h}.png")
+    def _load_named_pixmap(self, name, h):
+        """sprites/<name>.png 那一套的通用加载：现成档位优先，否则原图裁边后缩放。
+        文件不存在就返回 None（调用方自己决定退回什么）。"""
+        sized = os.path.join(SPRITE_DIR, f"{name}_{h}.png")
         if os.path.exists(sized):
             return QPixmap(sized)
-        base = self._view_base(os.path.join(SPRITE_DIR, "着急.png"))
+        base = self._view_base(os.path.join(SPRITE_DIR, f"{name}.png"))
         if base is None:
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
+
+    def _load_anxious_pixmap(self, h):
+        """追饭碗时的「着急」表情：sprites/着急.png（没有这张图就跳过，追逐时仍用方向图）。"""
+        return self._load_named_pixmap("着急", h)
 
     def _view_base(self, path):
         """某个视图"原图裁掉透明边"之后的那份，按「路径 + 修改时间」缓存。
@@ -6147,6 +6158,10 @@ class PetWindow(QWidget):
             anx = self._load_anxious_pixmap(h)      # 追饭碗的「着急」表情
             if anx is not None and not anx.isNull():
                 self.sprites[("着急", h)] = anx
+            for fn in ANIM_FRAMES:                  # 动画帧（眨眼 / 行走第二帧）
+                pix = self._load_named_pixmap(fn, h)
+                if pix is not None and not pix.isNull():
+                    self.sprites[(fn, h)] = pix
         self.widget_skin_ok = self._has_sprite("挂件")
 
     @staticmethod
@@ -6173,6 +6188,11 @@ class PetWindow(QWidget):
             anx = self._load_anxious_pixmap(h)
             if anx is not None and not anx.isNull():
                 self.sprites[("着急", h)] = anx
+        for fn in ANIM_FRAMES:
+            if (fn, h) not in self.sprites:
+                pix = self._load_named_pixmap(fn, h)
+                if pix is not None and not pix.isNull():
+                    self.sprites[(fn, h)] = pix
         self.widget_skin_ok = self._has_sprite("挂件")
 
     def _prune_sprites(self, keep_h):
@@ -6842,7 +6862,27 @@ class PetWindow(QWidget):
             return ("着急", self.cur_h,
                     self.facing if self.dir in ("left", "right") else 1)
         name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
+        name = self._anim_frame_name(name)
         return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
+
+    def _anim_frame_name(self, name):
+        """帧动画：待机眨眼、行走换腿。帧图没加载就退回静态图（不报错）。
+
+        - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
+        - 侧面 / 背面：行走时两帧轮换，节奏和上下颠簸（paintEvent 里的
+          bob = sin(now*4.5)）锁相 —— 一次颠簸迈一步，换腿正好踩在落脚点上
+        """
+        now = self._secs()
+        if name == "正面":
+            if now < self._blink_until and ("正面-眨", self.cur_h) in self.sprites:
+                return "正面-眨"
+        elif name in ("侧面", "背面"):
+            walking = self.target is not None and not self.dragging
+            alt = f"{name}-2"
+            if (walking and math.sin(now * 4.5) < 0
+                    and (alt, self.cur_h) in self.sprites):
+                return alt
+        return name
 
     def _set_dir(self, d, facing=None):
         if d != self.dir:
@@ -7197,6 +7237,13 @@ class PetWindow(QWidget):
             self.action_t = max(0.0, self.action_t - 0.03)
             if self.action_t == 0:
                 self.action = None
+
+        # 眨眼调度：每隔 2.5~6 秒眨一下（0.16 秒）。放在各 return 之前，
+        # 菜单开着、原地待着、散步休息时都照眨。画哪帧由 _anim_frame_name 看钟决定。
+        now_s = self._secs()
+        if now_s >= self._next_blink:
+            self._blink_until = now_s + 0.16
+            self._next_blink = now_s + random.uniform(2.5, 6.0)
 
         if self.ui_open:        # 菜单 / 对话框开着：站住不动，免得跳上去把设置面板遮住
             if self.perf_mode:
