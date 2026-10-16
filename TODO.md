@@ -1,5 +1,41 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-16 傍晚：图层三修 + 双击叫 DSH）
+
+主人 2026-10-16 原话：
+
+> 「现在，桌宠转为背面时，白饭图标应该在桌宠图层下面，同时现在无法双击启动
+> deepseek harness，右键点击时出现的选项栏比白饭图标图层低」
+
+三条全修了，见 CHANGELOG v1.1.6「右键菜单不再被饭碗压住」「双击桌宠叫 DSH」两节。
+
+- ① 菜单被饭碗压住：根因是 `_demote_topmost` 只降桌宠自己，饭碗 / 状态条还是置顶，
+  菜单是 Qt 普通弹出窗 → 碗浮在菜单上面。现在让位 / 还原都是"桌宠 + 饭碗 + 状态条"
+  整组一起动（`_demote_topmost` 里加 `_put()`，`_sync_overlay_state` 的还原走 `_apply_layer()`）。
+- ② 背影时饭碗该在下面：根因是"两个置顶窗之间 raise_()/lower() 的次序 Qt 不保证"，
+  实测走一会儿碗又浮上去。改成按需切置顶标志（`_rice_set_above`：背影 HWND_NOTOPMOST、
+  其余 HWND_TOPMOST），自愈那条路原来**无条件** `bowl.raise_()` 也改成跟着方向走。
+- ③ 双击拉不起 DSH：`dsh-debug.log` 里 18:05 连续三条
+  `click running=True state=hidden hwnd=0x10a0c` + `branch=RELAUNCH ... ok=True`
+  —— DSH 按 × 只是 hide 窗口、进程留在后台，桌宠原来"重跑 exe 让 DSH 自己 show"，
+  而 Electron 的单实例判断让第二个实例直接退出，窗口永远不回来。
+  现在 `state=hidden` 先走新的 `dsh_show_window()`（ShowWindow SW_SHOWNOACTIVATE /
+  最小化时 SW_RESTORE，再用 IsWindowVisible 复核），叫不回来才 RELAUNCH。
+  另：`DSH_PROC_NAMES` 认 `WorkBuddyAI.exe`（DSH 的分身）。
+- 排查时顺带的发现（都没改，留着）：
+  - 桌宠自己的窗口**没有**低完整性标签（`lowLabel` 为空），沙箱却给它的 ACL 里
+    加了一条 `Everyone` 的 `DeleteSubdirectoriesAndFiles` 拒绝项 —— 这是 DSH 沙箱
+    自己布的局；`_work` / `sprites` / `acl-recovery` 这些**子目录**被这条拒绝项挡住，
+    在沙箱里新建 / 写入文件会 `WinError 5`（只有工作区**根目录**可写）。
+    表现：`_work/test_dsh_status.py` 跑不动（它要往系统临时目录写文件），
+    别的离屏回归只要不落临时文件就没事。
+  - 这台机器**没有 F 盘**（只有 C、D）：AGENTS.md 里的 `F:\Codex\work\publish-pet.ps1`、
+    `F:\Codex\tools\innosetup\ISCC.exe` 都取不到，**发版流程在这台机器上跑不通**。
+    要发版得先把发布脚本 + Inno Setup 换到 D 盘，并改 AGENTS.md 里的旧路径。
+  - 本机原生跑着 DSH 时有个 18 分钟的空闲休眠：15:53 启动的实例窗口一直是
+    `visible=True`，到 16:43 变成 `visible=False`（进程不退）。所以"双击叫回来"
+    这条路以后会常用到。
+
 ## v1.1.6 追加（2026-10-16 下午：行走三修 + GitHub 动作调研）
 
 主人 2026-10-16 原话：
@@ -9,6 +45,13 @@
 > 2.侧面图行走时，没有双腿交替的感觉
 > 3.往后走也是一样，同时白饭图标会显示在桌宠头顶」
 > 「我觉得对于更各种动作，你可以先去GitHub上看看」
+> 「别的啥也不要弄不搞，就帮我生成双腿交替的行走图片」
+> 「左右腿交替，还有背面图没有尾巴了」
+
+- 行走帧按后两条原话返工：侧面第二帧 AI 续画两次都不真正换腿（只换抬脚），
+  最后用 PIL 手术把第一帧的两只鞋整列互换（`_work/apply_walk_frames3d.py`），
+  前后脚真正交替；背面第二帧 AI 重画成尾巴清晰摆向左侧 + 抬起一边脚跟
+  （`_work/帧3-背面-alt.png`）。真机三连拍确认落脚点前后互换。CHANGELOG 已同步。
 
 - 三条全修了，见 CHANGELOG v1.1.6「行走更像样了」一节：
   ① `_face_travel` 从"横向 2 倍才侧身"改成"默认侧身 + 迟滞"（斜向散步稳稳出侧面）；
