@@ -1,6 +1,6 @@
 ; 大肥鱼桌宠 · Windows 安装包脚本（Inno Setup 6）
-; 编译：ISCC.exe /DMyAppVersion=1.0.14 installer.iss
-; 产物：dist\大肥鱼桌宠-安装版-v1.0.14.exe
+; 编译：ISCC.exe /DMyAppVersion=1.1.6 installer.iss
+; 产物：dist\大肥鱼桌宠-安装版-v1.1.6.exe
 ; 特点：双击运行 → 中文向导，能选安装位置（默认装到"当前用户"目录，不弹 UAC）、
 ;       建桌面/开始菜单快捷方式、在"设置 → 应用"里能卸载，装完安装包本身就能删。
 
@@ -11,8 +11,15 @@
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
 #endif
+; 简体中文语言文件。旧机器放在 F:\Codex\tools\innosetup-lang\ 下，那台机器没了之后
+; 这个写死的路径会让编译直接失败。现在默认找**仓库里**的 tools\ChineseSimplified.isl，
+; 也可以命令行覆盖：
+;   ISCC.exe /DMyLangFile="D:\Inno Setup 6\Languages\ChineseSimplified.isl" installer.iss
+; 仓库里没有那个文件时的两个办法（任选其一）：
+;   ① 从 Inno Setup 安装目录的 Languages\ 里拷一份到仓库 tools\ 下；
+;   ② 从 https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation 下载。
 #ifndef MyLangFile
-  #define MyLangFile "F:\Codex\tools\innosetup-lang\ChineseSimplified.isl"
+  #define MyLangFile "tools\ChineseSimplified.isl"
 #endif
 
 [Setup]

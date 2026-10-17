@@ -290,6 +290,14 @@ WALK_FREQ = math.pi / WALK_LEG_S
 # 「原地待着时也跟着鼠标转」的"鼠标贴身上"半径：鼠标在这个圈里就当正面（不左右转）
 STILL_FACE_NEAR = 70
 
+# 跟随鼠标（follow）模式下换朝向的两道闸（主人 2026-10-16 反馈"跟随鼠标时饭碗一直闪"）。
+# 跟随模式每帧都把目标点算成"光标 + 往下 60px"，桌宠在目标附近小幅移动时
+# dx/dy 会在比例边界上来回抖 —— 朝向每帧变一次，饭碗就跟着整块挪位 + 换层。
+#   FOLLOW_FACE_DEAD = 竖直方向给 60px 的死区（光标跟前时不因为一两像素就转身）
+#   FOLLOW_FACE_MIN_S = 亲妈范围内最快 0.3 秒才换一次朝向
+FOLLOW_FACE_DEAD = 60.0
+FOLLOW_FACE_MIN_S = 0.3
+
 # ===== 它说话的调子 =====
 # 统一风格：俏皮、机灵、有点小得意也爱撒娇的少女；句子短、口语、（呀／嘛／啦／诶／哦）。
 # 三条不要：不要"AI 味"的排比和解释腔、不要说教、不要脏话。
@@ -634,24 +642,34 @@ DOUBLE_CLICK_DEFAULT = "balance"
 # 想换 DSH 位置：在 config.json 里加一条  "dsh_path": "D:\\你的\\DeepSeek Harness.exe"
 DSH_EXE = r"D:\dsh\DeepSeek Harness.exe"
 DSH_PROC_NAME = "DeepSeek Harness.exe"
+# 这台机器上 DSH 还有个"分身"：WorkBuddyAI（同一次更新装出来的另一份 Electron 壳）。
+# 认窗口 / 认进程两条路都把它一起算上，换哪份跑都认得出。
+DSH_PROC_NAMES = ("DeepSeek Harness.exe", "WorkBuddyAI.exe")
 
 
 def dsh_is_running():
-    """DSH 在不在跑。首选"找窗口"（快、不依赖 PATH），找不到才退回 tasklist。"""
+    """DSH 在不在跑。首选"找窗口"（快、不依赖 PATH），找不到才退回 tasklist。
+
+    注意：**进程活着不等于窗口能用**。DSH 被 × 收进后台（Electron hide）时进程还在、
+    主窗口还在，只是 IsWindowVisible 是假 —— 这时候"在跑"要交给 dsh_show_window 处理
+    （见 PetWindow._dsh_do_focus），不能当成"一切正常"。
+    """
     try:
         if dsh_probe().get("found"):
             return True
     except Exception:
         pass
     try:
-        out = subprocess.run([_dsh_tasklist_path(), "/FI", "IMAGENAME eq " + DSH_PROC_NAME,
-                              "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, errors="ignore",
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=6)
-        for line in (out.stdout or "").splitlines():
-            cells = [c.strip().strip('"') for c in line.split('","')]
-            if len(cells) >= 2 and cells[1].isdigit():
-                return True
+        for name in DSH_PROC_NAMES:
+            out = subprocess.run([_dsh_tasklist_path(), "/FI", "IMAGENAME eq " + name,
+                                  "/NH", "/FO", "CSV"],
+                                 capture_output=True, text=True, errors="ignore",
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                 timeout=6)
+            for line in (out.stdout or "").splitlines():
+                cells = [c.strip().strip('"') for c in line.split('","')]
+                if len(cells) >= 2 and cells[1].isdigit():
+                    return True
     except Exception as exc:
         dsh_debug("dsh_is_running: tasklist failed %r" % (exc,))
     return False
@@ -666,6 +684,45 @@ def dsh_launch(exe_path):
     except Exception:
         pass
     return False
+
+
+def dsh_show_window(hwnd=0):
+    """把**被收进后台（隐藏）/ 最小化**的 DSH 主窗口叫回来，并抬到最前面。
+
+    为什么非要这个：DSH 是 Electron，按 × 不是退出，是把窗口 hide 掉、进程留在后台
+    （实测 dsh-debug.log：15:53 那份进程一直在，窗口 0x10a0c 还在，
+    IsWindowVisible=False、尺寸仍是 1135x1025）。这种状态下桌宠原来的处理是
+    `dsh_launch(path)` 重跑一次 exe，可 Electron 的"单实例"判断认为"我本来就活着"，
+    第二次实例直接退出 —— 表现就是**双击桌宠什么也不发生**（主人 2026-10-16 反馈）。
+    这里直接把那个还活着的窗口显示出来，不走单实例那条路。
+
+    ShowWindow 的返回值说的是"窗口**原来**可不可见"，不能当成功判据，
+    所以最后拿 IsWindowVisible 重新读一次。
+
+    成功返回 True。
+    """
+    if not hwnd:
+        hwnd = dsh_main_hwnd()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.IsWindowVisible.restype = wintypes.BOOL
+        u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化 -> 还原
+        else:
+            u32.ShowWindow(hwnd, 4)          # SW_SHOWNOACTIVATE：显示但不抢焦点
+        if not u32.IsWindowVisible(hwnd):
+            return False
+        dsh_raise_window(hwnd)               # 说好的"看得到"就得真在前面
+        return True
+    except Exception as exc:
+        dsh_debug("dsh_show_window: %r" % (exc,))
+        return False
 
 
 def _dsh_tasklist_path():
@@ -684,6 +741,26 @@ def dsh_debug(msg):
         pass
 
 
+def dsh_is_main_window(cls, title, ex_style, iconic, w, h):
+    """这扇窗是不是 DSH 的主窗口（纯判据，方便离屏量）。
+
+    规则：类名 Chrome_WidgetWin_1 + 标题里带 "DeepSeek Harness" + 不是透明 /
+    不可激活 / 工具窗口；**先看是不是最小化，再看尺寸** —— 最小化窗口的 rect
+    是 -32000 那一套，先做尺寸过滤会把它当成"不存在"。
+    后台残留的 0x0 窗口（DSH 被 × 收起来时那个）会被尺寸过滤挡掉。
+    """
+    if cls != "Chrome_WidgetWin_1":
+        return False
+    if "DeepSeek Harness" not in (title or ""):
+        return False
+    WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x20, 0x80, 0x08000000
+    if ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW):
+        return False
+    if not iconic and (w < 200 or h < 150):
+        return False
+    return True
+
+
 def dsh_probe():
     """一次 EnumWindows 把需要的信息全拿到。
 
@@ -691,9 +768,7 @@ def dsh_probe():
     界面线程卡住，表现就是桌宠"卡顿一下"），一次枚举大约 1 毫秒。
 
     返回 dict: found / hwnd / visible / iconic / fg_hwnd
-    认定 DSH 主窗口的规则：类名 Chrome_WidgetWin_1 + 标题里带 "DeepSeek Harness"
-    + 不是透明 / 不可激活 / 工具窗口。**先看是不是最小化，再看尺寸** ——
-    最小化窗口的 rect 是 -32000 那一套，先做尺寸过滤会把它当成"不存在"。
+    认定主窗口的规则见 dsh_is_main_window()。
     """
     info = {"found": False, "hwnd": 0, "visible": False, "iconic": False, "fg_hwnd": 0}
     try:
@@ -723,22 +798,16 @@ def dsh_probe():
         def _cb(hwnd, _lparam):
             cls = ctypes.create_unicode_buffer(256)
             u32.GetClassNameW(hwnd, cls, 256)
-            if cls.value != "Chrome_WidgetWin_1":
-                return True
             title = ctypes.create_unicode_buffer(512)
             u32.GetWindowTextW(hwnd, title, 512)
-            if "DeepSeek Harness" not in title.value:
-                return True
             ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if ex & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW):
-                return True
             iconic = bool(u32.IsIconic(hwnd))
+            rect = wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if not dsh_is_main_window(cls.value, title.value, int(ex), iconic, w, h):
+                return True
             visible = bool(u32.IsWindowVisible(hwnd))
-            if not iconic:                       # 最小化窗口的 rect 不可信，跳过尺寸判断
-                rect = wintypes.RECT()
-                u32.GetWindowRect(hwnd, ctypes.byref(rect))
-                if (rect.right - rect.left) < 200 or (rect.bottom - rect.top) < 150:
-                    return True
             rank = 0 if (visible and not iconic) else (1 if visible else 2)
             cands.append((rank, hwnd, visible, iconic))
             return True
@@ -786,14 +855,16 @@ def dsh_pids():
     if pids:
         return pids
     try:
-        out = subprocess.run([_dsh_tasklist_path(), "/FI", "IMAGENAME eq " + DSH_PROC_NAME,
-                              "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, errors="ignore",
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=6)
-        for line in (out.stdout or "").splitlines():
-            cells = [c.strip().strip('"') for c in line.split('","')]
-            if len(cells) >= 2 and cells[1].isdigit():
-                pids.add(int(cells[1]))
+        for name in DSH_PROC_NAMES:
+            out = subprocess.run([_dsh_tasklist_path(), "/FI", "IMAGENAME eq " + name,
+                                  "/NH", "/FO", "CSV"],
+                                 capture_output=True, text=True, errors="ignore",
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                 timeout=6)
+            for line in (out.stdout or "").splitlines():
+                cells = [c.strip().strip('"') for c in line.split('","')]
+                if len(cells) >= 2 and cells[1].isdigit():
+                    pids.add(int(cells[1]))
     except Exception as exc:
         dsh_debug("dsh_pids: tasklist failed %r" % (exc,))
     return pids
@@ -821,11 +892,32 @@ def dsh_foreground_hwnd():
         return 0
 
 
+def win_is_topmost(widget):
+    """这个窗口现在是不是"置顶"（WS_EX_TOPMOST）。拿不到就当 False。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        ex = user32.GetWindowLongPtrW(ctypes.c_void_p(int(widget.winId())), -20)
+        return bool(int(ex or 0) & 0x00000008)      # WS_EX_TOPMOST
+    except Exception:
+        return False
+
+
 def dsh_raise_window(hwnd=0):
-    """把（本来就可见的）DSH 主窗口抬到最上层 + 给焦点。
+    """把（本来就可见的）DSH 主窗口抬到最上层 + 给它焦点。
 
     **完全不碰 ShowWindow**（不改可见性），所以不会和 Electron 的内部状态打架。
     传入 hwnd 时不再重复枚举。成功返回 True。
+
+    ⚠ **绝对不要用 AttachThreadInput 抢前台**（2026-10-16 拔掉的）。
+    老写法在 SetForegroundWindow 失败时会把自己的输入队列和前台线程"粘"起来：
+    这只是把输入队列接在一起，接上之后**前台窗口（这里是 DSH）会变成点不动** ——
+    主人反馈的"双击出来的 DSH 界面无法点击任何东西"就是它，而且这条路上出过两次。
+    真接上了还得原样拆开（老代码在异常时不拆，等于把桌面卡住）。
+    现在只用两条原子 API：SetForegroundWindow 失败就换 SwitchToThisWindow
+    （系统给"用户刚操作过的那一方"用的，不碰输入队列）。抬不上去也不动它别的状态。
     """
     if not hwnd:
         hwnd = dsh_main_hwnd()
@@ -835,30 +927,21 @@ def dsh_raise_window(hwnd=0):
         import ctypes
         from ctypes import wintypes
         u32 = ctypes.windll.user32
-        k32 = ctypes.windll.kernel32
         u32.BringWindowToTop.argtypes = [wintypes.HWND]
         u32.SetForegroundWindow.argtypes = [wintypes.HWND]
         u32.SetForegroundWindow.restype = wintypes.BOOL
         u32.GetForegroundWindow.restype = wintypes.HWND
-        u32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
         u32.IsWindowVisible.argtypes = [wintypes.HWND]
         u32.IsIconic.argtypes = [wintypes.HWND]
-        k32.GetCurrentThreadId.restype = wintypes.DWORD
 
         if u32.IsIconic(hwnd):
             return False                                   # 最小化的不在"抬高"范围内
         u32.BringWindowToTop(hwnd)
         if not u32.SetForegroundWindow(hwnd):
             try:
-                fg = u32.GetForegroundWindow()
-                fg_tid = u32.GetWindowThreadProcessId(fg, None)
-                my_tid = k32.GetCurrentThreadId()
-                if fg_tid and fg_tid != my_tid:
-                    u32.AttachThreadInput(fg_tid, my_tid, True)
-                    u32.SetForegroundWindow(hwnd)
-                    u32.AttachThreadInput(fg_tid, my_tid, False)
-                else:
-                    u32.SetForegroundWindow(hwnd)
+                # Win2000 起就有、至今还在用的"切到某个窗口"接口，逻辑在系统内部，
+                # 不会改我们自己的输入队列
+                ctypes.windll.user32.SwitchToThisWindow(wintypes.HWND(hwnd), True)
             except Exception:
                 pass
         return bool(u32.IsWindowVisible(hwnd))
@@ -1302,8 +1385,17 @@ VIEW_LABELS = {"front": "正面（朝屏幕下）", "side": "侧面（左右走�
 # 短名字：菜单 / 对话框 / 冒泡里用得着（VIEW_LABELS 太长）
 VIEW_SHORT = {"front": "正面", "side": "侧面", "back": "背面", "widget": "挂件"}
 # 动画帧素材（缺哪张就自动退回对应的静态图，不报错）：
-#   正面-眨 —— 待机/正面行走时的眨眼帧；侧面-2 / 背面-2 —— 行走循环的第二帧
-ANIM_FRAMES = ("正面-眨", "侧面-2", "背面-2")
+#   正面-眨 —— 待机/正面行走时的眨眼帧；
+#   侧面-2 / 侧面-3 —— 侧面行走的另外两帧（小迈步 / 大迈步），配合静态「侧面」成循环
+#   背面-2 / 背面-3 / 背面-4 —— 背面行走的四帧循环
+ANIM_FRAMES = ("正面-眨", "侧面-2", "侧面-3", "背面-2", "背面-3", "背面-4")
+# 行走循环的帧序。**侧面是"小迈步 → 并脚 → 大迈步 → 并脚"**：
+# 静态「侧面」是并脚站姿（主人 2026-10-17 18:05 单独给的单帧），
+# 它同时充当循环里的过渡姿势，所以这里会出现两次。
+WALK_FRAMES = {
+    "侧面": ("侧面-2", "侧面", "侧面-3", "侧面"),
+    "背面": ("背面", "背面-2", "背面-3", "背面-4"),
+}
 
 # 打开的某些应用时冒泡吐槽（进程名小写）
 PROCESS_LINES = {
@@ -4488,13 +4580,14 @@ class PetWindow(QWidget):
         self._rice = None
         self._rice_chasing = False
         self._rice_next_line = 0.0
+        self._rice_z_above = None     # 饭碗当前摆的是"桌宠上面(True) / 后面(False)"
         if self.cfg.get("rice_bowl", True):
             try:
                 self._rice = RiceBowl(self)
                 self._rice_carry_update(snap=True)
                 if self._rice_three_view():        # 单张形象不显示饭碗
                     self._rice.show()
-                    self._rice.raise_()
+                    self._rice_set_above(True)
             except Exception as _rice_exc:
                 print("白饭碗起不来:", _rice_exc)
                 self._rice = None
@@ -6109,13 +6202,23 @@ class PetWindow(QWidget):
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
 
-    def _load_named_pixmap(self, name, h):
-        """sprites/<name>.png 那一套的通用加载：现成档位优先，否则原图裁边后缩放。
-        文件不存在就返回 None（调用方自己决定退回什么）。"""
+    def _load_named_pixmap(self, name, h, crop=True):
+        """sprites/<name>.png 那一套的通用加载：现成档位优先，否则原图缩放。
+        文件不存在就返回 None（调用方自己决定退回什么）。
+
+        `crop=False` 用于**帧动画**：帧图必须保留整块画布、不能各自裁透明边 ——
+        四帧外接框不一样，裁完再缩到同一高度就成了四个不同宽度，走路会横向抖
+        （主人 2026-10-17 换上四帧背面行走图时踩到的）。
+        """
         sized = os.path.join(SPRITE_DIR, f"{name}_{h}.png")
         if os.path.exists(sized):
             return QPixmap(sized)
-        base = self._view_base(os.path.join(SPRITE_DIR, f"{name}.png"))
+        path = os.path.join(SPRITE_DIR, f"{name}.png")
+        if crop:
+            base = self._view_base(path)
+        else:
+            raw = QPixmap(path)
+            base = None if raw.isNull() else raw
         if base is None:
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
@@ -6164,10 +6267,20 @@ class PetWindow(QWidget):
             anx = self._load_anxious_pixmap(h)      # 追饭碗的「着急」表情
             if anx is not None and not anx.isNull():
                 self.sprites[("着急", h)] = anx
-            for fn in ANIM_FRAMES:                  # 动画帧（眨眼 / 行走第二帧）
-                pix = self._load_named_pixmap(fn, h)
+            for fn in ANIM_FRAMES:                  # 动画帧（眨眼 / 行走各帧）
+                pix = self._load_named_pixmap(fn, h, crop=False)
                 if pix is not None and not pix.isNull():
                     self.sprites[(fn, h)] = pix
+            # 帧动画的"第一帧"就是各方向的静态图。它走的是 _load_view_pixmap（会裁透明边），
+            # 和动画帧（不裁边）尺寸会差 1~2 像素 —— 走路时就会看到"第一帧宽一点"的抖。
+            # 所以只要该方向有动画帧，就用不裁边的方式把静态图也覆盖一遍，保证同一块画布。
+            for view, key in VIEW_SHORT.items():
+                if view == "widget":
+                    continue
+                if any(k[0].startswith(key + "-") for k in self.sprites if k[1] == h):
+                    pix = self._load_named_pixmap(key, h, crop=False)
+                    if pix is not None and not pix.isNull():
+                        self.sprites[(key, h)] = pix
         self.widget_skin_ok = self._has_sprite("挂件")
 
     @staticmethod
@@ -6196,9 +6309,18 @@ class PetWindow(QWidget):
                 self.sprites[("着急", h)] = anx
         for fn in ANIM_FRAMES:
             if (fn, h) not in self.sprites:
-                pix = self._load_named_pixmap(fn, h)
+                pix = self._load_named_pixmap(fn, h, crop=False)
                 if pix is not None and not pix.isNull():
                     self.sprites[(fn, h)] = pix
+        # 同 _rebuild_sprites：有动画帧的方向，静态图也换成不裁边的版本，
+        # 否则第一帧和后面的帧差 1~2 像素，走路会横向抖。
+        for view, key in VIEW_SHORT.items():
+            if view == "widget":
+                continue
+            if any(k[0].startswith(key + "-") for k in self.sprites if k[1] == h):
+                pix = self._load_named_pixmap(key, h, crop=False)
+                if pix is not None and not pix.isNull():
+                    self.sprites[(key, h)] = pix
         self.widget_skin_ok = self._has_sprite("挂件")
 
     def _prune_sprites(self, keep_h):
@@ -6515,15 +6637,9 @@ class PetWindow(QWidget):
             self._paint_lyric_bubble(p)
 
         cx = self.width() / 2
-        walking = self.target is not None and not self.dragging
-        if walking:
-            # 摇摆按完整步态周期（两步一摇），颠簸和换腿同频：每步落地一次
-            sway = math.sin(now * WALK_FREQ / 2) * 3.0
-            bob = -abs(math.sin(now * WALK_FREQ)) * 5.0
-        else:
-            sway = math.sin(now * 2.5) * 1.5
-            bob = 0.0
-        breath = 1.0 + 0.02 * math.sin(now * 2.5)
+        # 晃动参数和饭碗共用一份（_anim_shake）：sway = 摇摆角、bob = 上下颠簸、
+        # breath = 呼吸缩放。走路时摇摆/颠簸更大，待机时只有轻轻左右摇。
+        sway, bob, _sway_again, breath = self._anim_shake()
         scale = breath
         jump = -abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t if self.jump_t > 0 else 0
         act_rot = act_sx = act_sy = 0.0
@@ -6873,32 +6989,64 @@ class PetWindow(QWidget):
         return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
 
     def _anim_frame_name(self, name):
-        """帧动画：待机眨眼、行走换腿。帧图没加载就退回静态图（不报错）。
+        """帧动画：待机眨眼、行走换帧。帧图没加载就退回静态图（不报错）。
 
         - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
-        - 侧面 / 背面：行走时两帧轮换，节奏和上下颠簸（paintEvent 里的
-          bob = -abs(sin(now*WALK_FREQ))）锁相 —— 每 0.22 秒迈一步，
-          换腿正好踩在落脚点上
+        - 侧面 / 背面：行走时按 `WALK_FRAMES[name]` 那一串循环
+          （侧面 10 帧、背面 4 帧，主人 2026-10-17 给的两套素材）。
+          步频仍是 WALK_LEG_S 一步（0.22 秒），一整个循环 = 两步 = 0.44 秒，
+          帧序均匀铺在这段时间里；缺哪一帧就退回静态图，不会报错。
         """
         now = self._secs()
         if name == "正面":
             if now < self._blink_until and ("正面-眨", self.cur_h) in self.sprites:
                 return "正面-眨"
-        elif name in ("侧面", "背面"):
-            walking = self.target is not None and not self.dragging
-            alt = f"{name}-2"
-            if (walking and math.sin(now * WALK_FREQ) < 0
-                    and (alt, self.cur_h) in self.sprites):
-                return alt
+            return name
+        frames = WALK_FRAMES.get(name)
+        if not frames:
+            return name
+        if self.target is None or self.dragging:      # 没走就站着
+            return name
+        # 一整个行走循环 0.44 秒（两步）；换算成 0..len 的连续位置再取整
+        phase = (now * WALK_FREQ / (2 * math.pi)) * 2.0 % 1.0
+        idx = int(phase * len(frames)) % len(frames)
+        key = frames[idx]
+        if (key, self.cur_h) in self.sprites:
+            return key
         return name
 
     def _set_dir(self, d, facing=None):
         if d != self.dir:
+            if d == "up":
+                # 记下"开始朝屏幕里走"的时刻：饭碗要等这个朝向稳够 RICE_CHEST_HOLD_S
+                # 才收进怀里（位置 + 图层一起切），免得跟随鼠标时擦到一下 up 就把碗挪进去。
+                self._rice_up_since = self._secs()
             self.prev_key = self._sprite_key()
             self.cross_t = 1.0
             self.dir = d
         if facing is not None and facing != self.facing:
             self.facing = facing
+
+    def _face_travel_follow(self, dx, dy):
+        """跟随鼠标专用：先给 dy 一道死区、再限一个最小换向间隔，然后才交给 `_face_travel`。
+
+        为什么要单开一条（主人 2026-10-16 反馈"跟随鼠标时饭碗图标一直闪"）：
+        跟随模式每帧都把目标点算成"光标 + 往下 60px"，桌宠在目标附近小幅移动时，
+        dx/dy 的比例正好在 `_face_travel` 的迟滞边界上来回跳 —— 朝向每帧变一次，
+        饭碗就跟着整块挪位 + 换一次图层，看着就是抖着闪。
+        死区把"光标跟前那几像素的上下抖动"消掉，最小间隔保证朝向不会比
+        0.3 秒更勤地翻面（散步 wander 不走这条，保持原来的灵活度）。
+        """
+        try:
+            if abs(dy) < FOLLOW_FACE_DEAD:      # 竖直方向在死区里：当它是平的
+                dy = 0.0
+            now = self._secs()
+            if now - getattr(self, "_follow_face_t", 0.0) < FOLLOW_FACE_MIN_S:
+                return
+            self._follow_face_t = now
+        except Exception:
+            pass
+        self._face_travel(dx, dy)
 
     def _face_travel(self, dx, dy, ratio=1.2):
         """按"这一步往哪走"给朝向（dx/dy 是窗口中心 → 目标点的位移）。
@@ -6993,11 +7141,13 @@ class PetWindow(QWidget):
                     drop = 0.25 * bh
 
         ax = sprite_cx - bw * 0.5 + offset_x
-        if three and dir_ == "up":
+        if self._rice_in_chest():
             # 背影（走向屏幕里）：碗是"抱在怀里、背对着你"，就收在身体正中、
             # 手的高度，图层降到桌宠后面（见 _rice_tick）—— 正好被身体整个挡住。
             # 以前是举到头顶那一带露出大半个碗，主人反馈"往后走时白饭图标
             # 显示在桌宠头顶"，像顶在头上，不对。
+            # 判据用 _rice_in_chest() 而不是直接看 dir：**位置和图层必须同时切**，
+            # 否则会出现"碗已经挪到怀里、却还在桌宠上面"那一小段（被身体压住的错觉）。
             ay = sprite_bottom - bh * 1.95
         else:
             ay = sprite_bottom - bh * 1.95 + drop
@@ -7009,6 +7159,43 @@ class PetWindow(QWidget):
             pass
         return (int(ax), int(ay))
 
+    def _anim_shake(self):
+        """桌宠此刻的"晃动"参数 (sway, bob, rotate, scale_one)。
+
+        **和 paintEvent 里画精灵用的是同一套公式**：待机时左右轻摇（±1.5px、
+        周期 2.5）、呼吸缩放 ±2%；走路时摇摆更大、还带上下颠簸。
+        抽出来是为了让饭碗也跟着晃（主人要求"白饭图标和桌宠待机时一起晃动"）——
+        两处各写一份迟早会漂，改一处必须改两处。
+        """
+        now = self._secs()
+        walking = (self.target is not None and not self.dragging)
+        if walking:
+            # 摇摆按完整步态周期（两步一摇），颠簸和换腿同频：每步落地一次
+            return (math.sin(now * WALK_FREQ / 2) * 3.0,
+                    -abs(math.sin(now * WALK_FREQ)) * 5.0,
+                    math.sin(now * WALK_FREQ / 2) * 3.0,
+                    1.0 + 0.02 * math.sin(now * 2.5))
+        return (math.sin(now * 2.5) * 1.5,
+                0.0,
+                math.sin(now * 2.5) * 1.5,
+                1.0 + 0.02 * math.sin(now * 2.5))
+
+    def _rice_shake_offset(self):
+        """饭碗该额外偏移多少、缩放多少，才能跟着桌宠一起动。
+
+        返回 (左右, 上下, 缩放)。主人要的是**跟着一起缩放**（呼吸），
+        所以缩放按呼吸的倍数放大一点（精灵自己只有 ±2%，放大了才看得出来）；
+        左右随摇摆、走路时上下跟颠簸 —— 位置和缩放一起做，碗才是"贴在她身上"的。
+        """
+        sway, bob, _rot, breath = self._anim_shake()
+        dx = sway * RICE_SWAY_GAIN
+        if self.target is not None and not self.dragging:
+            dy = bob * RICE_BOB_GAIN
+        else:
+            dy = 0.0
+        scale = 1.0 + (breath - 1.0) * RICE_BREATH_GAIN
+        return dx, dy, scale
+
     def _rice_carry_update(self, snap=False):
         """把碗贴到桌宠手边（小幅缓动，看起来是"跟上来"而不是瞬移）。"""
         bowl = getattr(self, "_rice", None)
@@ -7018,6 +7205,16 @@ class PetWindow(QWidget):
         if pos is None:
             return
         ax, ay = pos
+        # 跟着桌宠一起动（主人 2026-10-16 要求"白饭图标和桌宠待机时一起晃动"，
+        # 随后明确是**缩放**）：左右跟 sway、走路跟颠簸，
+        # **饭碗窗口和图标一起跟着呼吸缩放**。
+        try:
+            sdx, sdy, sscale = self._rice_shake_offset()
+            bdx, bdy = bowl.apply_breath(sscale)     # 以底边中心缩放的补偿
+            ax += sdx - bdx
+            ay += sdy - bdy
+        except Exception:
+            pass
         cx, cy = bowl.x(), bowl.y()
         # 只要"朝向 / 姿态"变了（左<->右、侧面<->背影/正面），碗是整块换位置的，
         # 这一步必须瞬移：缓动会让它从桌宠身上滑过去，而碗画在桌宠上层，很难看。
@@ -7036,6 +7233,76 @@ class PetWindow(QWidget):
             bowl.move(ax, ay)
         else:
             bowl.move(int(cx + (ax - cx) * 0.35), int(cy + (ay - cy) * 0.35))
+
+    def _rice_wants_behind(self):
+        """碗现在该不该待在桌宠**后面一层**（背影时是"抱在怀里"，被身体挡住）。"""
+        return self._rice_in_chest()
+
+    def _rice_in_chest(self):
+        """现在算不算"背影、碗该收进怀里"（**位置和图层共用这一个判据**）。
+
+        除了方向是 up，还要求这个朝向**已经持续了一小会儿**（`rice_chest_hold`，
+        默认 0.2 秒）：跟随鼠标时朝向会在上下边界来回切，偶尔擦到一下 up
+        不该让碗整块挪进怀里又挪出来 —— 那正是主人说的"闪"。
+        持续够久才算真的转身，然后把位置和图层**同时**切过去（零延迟）。
+        """
+        if getattr(self, "dir", "down") != "up":
+            return False
+        if not self._rice_three_view():
+            return False
+        if not bool(self.cfg.get("rice_back_behind", True)):
+            return False
+        try:
+            hold = float(self.cfg.get("rice_chest_hold", RICE_CHEST_HOLD_S))
+        except Exception:
+            hold = RICE_CHEST_HOLD_S
+        try:
+            return self._secs() - getattr(self, "_rice_up_since", 0.0) >= hold
+        except Exception:
+            return True
+
+    def _pet_keeps_topmost(self):
+        """桌宠自己现在是不是真的挂在置顶层（菜单/对话框让位期间不是）。"""
+        return (not getattr(self, "ui_open", False)) and win_is_topmost(self)
+
+    def _rice_set_above(self, above):
+        """把饭碗明确摆到"桌宠上面一层"或"桌宠下面一层"。
+
+        为什么不用 Qt 的 raise_() / lower()：两个窗都是"置顶"窗口，在这之间
+        raise_/lower 的次序 Qt 不保证；实测背影时碗还是会浮在上面。这里直接用
+        SetWindowPos 改窗口的置顶标志 —— 碗在桌宠后面时降到普通层（被桌宠挡住），
+        在前面时回到置顶层。菜单开着时一律不抬（菜单后开的，得压住碗）。
+        """
+        bowl = getattr(self, "_rice", None)
+        if bowl is None:
+            return
+        try:
+            HWND_TOPMOST, HWND_NOTOPMOST, HWND_TOP = -1, -2, 0
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+            flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+            if above:
+                # 桌宠自己不是置顶（置底 / 普通层 / 菜单开着时临时让位）就别把碗抬到置顶层
+                if not self._pet_keeps_topmost():
+                    if win_is_topmost(bowl):
+                        bowl.raise_()        # 只按同层次序抬
+                    return
+                # ⚠ 两步都要：HWND_TOPMOST 只保证"在置顶组里"，
+                # **两个窗口都已经置顶时它不会把碗排到桌宠前面**
+                # （主人 2026-10-16 反馈"拖动几下饭碗就不见了"就是这条：碗一直排在
+                #   桌宠窗口后面，正面时靠位置错开才看得见，拖到身体上就被盖住）。
+                # 所以再补一次 HWND_TOP，把碗摆到**置顶组的最前面**。
+                ctypes.windll.user32.SetWindowPos(
+                    ctypes.c_void_p(int(bowl.winId())), ctypes.c_void_p(HWND_TOPMOST),
+                    0, 0, 0, 0, flags)
+                after = HWND_TOP
+            else:
+                after = HWND_NOTOPMOST
+            ctypes.windll.user32.SetWindowPos(
+                ctypes.c_void_p(int(bowl.winId())), ctypes.c_void_p(after),
+                0, 0, 0, 0, flags)
+            self._rice_z_above = bool(above)
+        except Exception:
+            pass
 
     def _rice_tick(self):
         """每帧一次：碗被拖着就追，否则抱着一起走。
@@ -7057,30 +7324,51 @@ class PetWindow(QWidget):
         # 而 Qt 改窗口标志时会顺手把可见窗口 hide 掉；退出时 _sync_overlay_state()
         # 只恢复了桌宠自己 —— 饭碗就这么不见了（主人反馈"形象切换就不显示图标"）。
         # 这里每帧兜一下，代价只有几个 O(1) 判断。
+        # **注意别再无条件 raise_**：背影（走屏幕里）时碗该在桌宠下面，这里一抬
+        # 就把它抬回上面了（主人 2026-10-16 反馈"转背面时白饭应该在图层下面"）。
         try:
             if self.isVisible() and not bowl.isVisible():
                 bowl.ensure_ok(self.cur_h)
                 bowl.show()
-                bowl.raise_()
+                # 自愈这条是"刚被藏起来又放出来"，不是朝向抖动：按当前朝向**立刻**摆正，
+                # 不走下面那道稳定期（碗刚出现就该是对的层级，不该先错一下）。
+                want = "behind" if self._rice_wants_behind() else "above"
+                self._rice_z_want = want
+                self._rice_z_since = self._secs()
+                self._rice_z_above = None       # 刚重显：强制按当前朝向重新摆一次
+                self._rice_set_above(want == "above")
                 dsh_debug("rice: 饭碗被藏了，自愈重新显示")
             elif bowl.ensure_ok(self.cur_h):
                 dsh_debug("rice: 饭碗图标/尺寸异常，已重建")
         except Exception:
             pass
-        # 两个窗口都是"置顶"，谁在上层得自己维持（每 5 帧≈100ms 一次，开销可忽略）：
+        # 两个窗口都是"置顶"，谁在上层得自己维持：**每帧查一次**（只花两次
+        # GetWindowLongPtr + 一次 GetWindow，可忽略），不一致才真的动窗口。
         #   - 朝后（背影，走向屏幕里）：碗要**在桌宠后面一层**，被身体挡住 —— 主人要求
         #   - 其余情况：碗在桌宠上面
-        if self.t % 5 == 0:
-            try:
-                behind = (getattr(self, "dir", "down") == "up"
-                          and self._rice_three_view()
-                          and bool(self.cfg.get("rice_back_behind", True)))
-                if behind:
-                    bowl.lower()
-                else:
-                    bowl.raise_()
-            except Exception:
-                pass
+        # 为什么必须每帧查、而不是隔几帧"摆一次"：
+        #   ① 反复动窗口 = 碗在合成器里来回进出置顶层，肉眼就是闪
+        #      （主人 2026-10-16 反馈"背面时饭碗图标会一直闪，一边加图层一边减图层"）；
+        #   ② 真有两边在抢：托盘菜单那套对账每 120ms 会调 _apply_layer() 把碗抬回置顶层，
+        #      谁都可能把我们的层级拨回去 —— 所以"查得勤 + 只在不一致时修"才稳。
+        # 另外：跟随鼠标时朝向本来就在上下之间来回切，每切一次碗就整块挪位 + 换层，
+        # 看着又闪又花 —— 所以换状态前要求它先稳住 RICE_Z_SETTLE_S 秒。
+        # 这道稳定期**默认 0 秒（不拖）**：它每次都会让"碗还没换层、桌宠已经转身"
+        # 的那一下被看见，主人连着两次反馈"转向背面有延迟"（1s → 0.5s）都是它。
+        # 抖动的病根在**朝向**上，已经有 `_face_travel_follow` 的两道闸
+        # （死区 + 最少 0.3 秒才换朝向）挡着，饭碗跟着方向走就不会乱切。
+        # 真嫌晃就把 config.json 的 rice_z_settle 调大（0.1~0.3）。
+        try:
+            want = "behind" if self._rice_wants_behind() else "above"
+            if want != getattr(self, "_rice_z_want", None):
+                self._rice_z_want = want
+                self._rice_z_since = self._secs()
+            if (getattr(self, "_rice_z_above", None) != (want == "above")
+                    and (self._secs() - getattr(self, "_rice_z_since", 0.0)
+                         >= float(self.cfg.get("rice_z_settle", RICE_Z_SETTLE_S)))):
+                self._rice_set_above(want == "above")
+        except Exception:
+            pass
         if bowl.dragging:
             if not self._rice_chasing:
                 self.prev_key = self._sprite_key()   # 换「着急」表情也走淡入淡出
@@ -7331,7 +7619,7 @@ class PetWindow(QWidget):
                 mx = max(geo.left(), min(geo.right() - self.width() + 1, int(nx - self.width() / 2)))
                 my = max(geo.top(), min(geo.bottom() - self.height() + 1, int(ny - self.height() / 2)))
                 self.move(mx, my)
-                self._face_travel(dx, dy)
+                self._face_travel_follow(dx, dy)
             if random.random() < 0.002 and self.jump_t == 0:
                 self.jump_t = 0.5
         target_speed = SPEED if self.target is not None else 0.0
@@ -8206,12 +8494,14 @@ class PetWindow(QWidget):
          - 没在跑                        -> 启动
          - 在跑 & 窗口已经是前台         -> 什么都不做
          - 在跑 & 窗口可见但被挡住       -> 抬到最上层 + 给焦点（不动可见性）
-         - 在跑 & 窗口被 ×收起 / 最小化  -> 重跑一次 exe，让 DSH 自己 show
+         - 在跑 & 窗口被 ×收起 / 最小化  -> **把那个窗口叫回来**（dsh_show_window）
+                                           叫不回来才退回重跑一次 exe
          - 都不行                        -> 退回看余额
 
         两条铁律（踩出来的）：
         1) 必须延后执行：这是从 mouseReleaseEvent 里起头的。
-        2) 绝不用 Win32 ShowWindow 去"显示"被 Electron 藏起来的窗口。
+        2) 被 Electron 藏起来的窗口要走 ShowWindow（dsh_show_window），别指望
+           重跑一次 exe —— 单实例判断会让第二个实例直接退出，窗口照样不出现。
         """
         try:
             self.releaseMouse()
@@ -8255,7 +8545,11 @@ class PetWindow(QWidget):
                 if ok:
                     return
             else:
-                ok = dsh_launch(path)
+                ok = dsh_show_window(hwnd)       # 收起 / 最小化：先把窗口叫回来
+                dsh_debug("branch=SHOW state=%s ok=%s" % (state, ok))
+                if ok:
+                    return
+                ok = dsh_launch(path)            # 叫不回来才重跑 exe
                 dsh_debug("branch=RELAUNCH state=%s ok=%s" % (state, ok))
                 if ok:
                     return
@@ -8523,7 +8817,10 @@ class PetWindow(QWidget):
         if not bar.isVisible():
             bar.show()                      # 自愈：开对话框时 Qt 会顺手把可见窗口藏掉
         if self.t % 5 == 0:
-            bar.raise_()                    # 两个窗口都置顶，谁在上层得自己维持
+            # 两个窗口都置顶，谁在上层得自己维持；但菜单开着时状态条已经被
+            # _demote_topmost 降到普通层了，这里不能再抬回置顶（会压住菜单）。
+            if win_is_topmost(bar) and not self.ui_open:
+                bar.raise_()
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
@@ -9689,21 +9986,48 @@ class PetWindow(QWidget):
         return super().eventFilter(obj, ev)
 
     def _demote_topmost(self, on):
-        """菜单打开期间把自己降到非置顶（菜单关了再按设定层级还原）。"""
+        """菜单打开期间把自己降到非置顶（菜单关了再按设定层级还原）。
+
+        饭碗和 DSH 状态条要**一起降**：它们是自家的置顶小窗，以前只降桌宠自己，
+        菜单是 Qt 的普通弹出窗 —— 于是碗和状态条浮在菜单上面，压住菜单最下面几条
+        （主人 2026-10-16 反馈"右键选项栏比白饭图标图层低"就是这个）。
+        一起降下去，菜单天然在最上面；菜单一关由 _apply_layer() 按设定层级还原。
+        """
         try:
             HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
             SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+
+            def _put(w, after):
+                if w is None or after is None:
+                    return
+                try:
+                    # 幂等：已经是想要的那个层级就什么都不做。
+                    # 这里每 120ms 会被 _sync_overlay_state 调一次，不判一下的话
+                    # 菜单开着的时候碗 / 状态条会被反复 SetWindowPos（看着像在闪）。
+                    want_top = (after == HWND_TOPMOST)
+                    if win_is_topmost(w) == want_top:
+                        return
+                    ctypes.windll.user32.SetWindowPos(
+                        ctypes.c_void_p(int(w.winId())), ctypes.c_void_p(after),
+                        0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                except Exception:
+                    pass
+
             if on:
                 after = HWND_NOTOPMOST
             elif self.layer == "top":
                 after = HWND_TOPMOST
             else:
                 after = None
-            if after is None:
-                return
-            ctypes.windll.user32.SetWindowPos(
-                ctypes.c_void_p(int(self.winId())), ctypes.c_void_p(after),
-                0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            # 桌宠自己：层级不是"置顶"时不动它（老行为，别改）
+            if after is not None:
+                _put(self, after)
+            # 饭碗 / 状态条：菜单开着时一律跟着降到普通层；菜单关了由 _apply_layer 还原。
+            # 背影时的饭碗同样跳过（归 _rice_set_above 管），理由见 _apply_layer 的说明。
+            for w in (getattr(self, "_rice", None), getattr(self, "_dsh_bar", None)):
+                if w is getattr(self, "_rice", None) and self._rice_wants_behind():
+                    continue
+                _put(w, after if after is not None else HWND_NOTOPMOST)
         except Exception:
             pass
 
@@ -9855,7 +10179,8 @@ class PetWindow(QWidget):
         self._apply_passthrough(bool(self.cfg.get("passthrough", False)))   # 按用户自己的设置还原
         if not self.isVisible():
             self.show()
-        self.raise_()
+        # 还原层级用 _apply_layer（而不是只 raise_ 自己）：它会把饭碗 / 状态条
+        # 一起按设定层级摆回去，menu 期间它们是被 _demote_topmost 降下去的。
         self._apply_layer()
 
     def _sync_overlay_state(self):
@@ -9875,7 +10200,16 @@ class PetWindow(QWidget):
         visible = bool(self._dialog_open) or bool(visible_menus)
         if visible != self.ui_open:
             self.ui_open = visible
-            self._demote_topmost(visible)
+        if visible:
+            self._demote_topmost(True)
+        else:
+            # 还原走"整组窗口一起摆"的 _apply_layer（饭碗 / 状态条也一起）。
+            # 不能只在 visible 变化时才动：这里每 120ms 跑一次，哪怕信号漏了，
+            # "该在上面却还在普通层"也会被这对账纠回来。
+            if win_is_topmost(self) and win_is_topmost(getattr(self, "_rice", self)):
+                return
+            self._demote_topmost(False)
+            self._apply_layer()
         # 注意：**不要**让桌宠在菜单期间变成鼠标穿透。
         # 试过两版（整窗穿透 / 光标压在菜单上才穿透）都会出问题：右键桌宠时点击穿到桌面，
         # 弹出了 Windows 桌面的右键菜单。菜单压在桌宠上面的部分，靠"把桌宠降到非置顶"就够了。
@@ -10357,13 +10691,21 @@ class PetWindow(QWidget):
         饭碗和 DSH 状态条是跟着桌宠走的自家小窗，层级要跟桌宠一起摆 ——
         它们的 Qt 置顶标志只在创建时读过一次，不走这里的话，开着桌宠切层级
         它们要等重启才跟上。
+
+        **背影时的饭碗不归这里管**：那会儿它该在桌宠后面（普通层），
+        而这个函数只会把三个窗口一起设成同一层 —— 一起设成置顶反而会把碗顶到桌宠上面
+        （最近设置置顶的那个在最上面）。所以交给 `_rice_set_above()` 摆，
+        两边都别去拨它，Z 序才不会一会儿上一会儿下。
         """
         try:
             HWND_TOPMOST, HWND_NOTOPMOST, HWND_BOTTOM = -1, -2, 1
             SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
             after = {"top": HWND_TOPMOST, "bottom": HWND_BOTTOM,
                      "normal": HWND_NOTOPMOST}.get(self.layer, HWND_TOPMOST)
-            wins = [self, getattr(self, "_rice", None), getattr(self, "_dsh_bar", None)]
+            rice = getattr(self, "_rice", None)
+            if rice is not None and self._rice_wants_behind():
+                rice = None
+            wins = [self, rice, getattr(self, "_dsh_bar", None)]
             for w in wins:
                 if w is None:
                     continue
@@ -10716,27 +11058,29 @@ class PetWindow(QWidget):
                 return
         except Exception:
             pass
+        own_above = False
         try:
             GW_HWNDPREV, GWL_EXSTYLE, WS_EX_TOPMOST = 3, -20, 0x00000008
             user32 = ctypes.windll.user32
             user32.GetWindow.restype = ctypes.c_void_p
             above = user32.GetWindow(ctypes.c_void_p(int(self.winId())), GW_HWNDPREV)
             if above:
-                # 上面那层是自家的饭碗就别动：它不是"压住我的别的窗口"，而是我要抱着的东西。
-                # 不加这个判断的话，每 2 秒就会把自己抬到饭碗上面一次（主人反馈
-                # "切换到小鲸鱼挂件形象后饭碗不见了"就是这个打架的表现）。
-                # DSH 状态条同理：它也是自家跟着走的小窗，_dsh_bar_tick 每 5 帧
-                # 抬它一次，这里不豁免的话两边会每 2 秒抢一次 Z 序。
+                # 上面那层是自家的饭碗 / 状态条就**照样抬自己**，抬完再把碗摆回前面
+                # （`_rice_keep_above`）。以前这里是直接 return"别动"，结果桌宠自己
+                # 一直排在饭碗后面 —— 主人 2026-10-16 反馈"拖动几下饭碗就不见了"，
+                # 就是碗沉在后面、被身体盖住。状态条不用管，它本来就该在下面。
                 for _own in (getattr(self, "_rice", None), getattr(self, "_dsh_bar", None)):
                     if _own is not None:
                         try:
                             if int(above) == int(_own.winId()):
-                                return
+                                own_above = True
+                                break
                         except Exception:
                             pass
-                ex = user32.GetWindowLongPtrW(ctypes.c_void_p(above), GWL_EXSTYLE)
-                if not (int(ex) & WS_EX_TOPMOST):
-                    return               # 上面那个不是置顶窗口 → 我们本来就是最上面的，不用动
+                if not own_above:
+                    ex = user32.GetWindowLongPtrW(ctypes.c_void_p(above), GWL_EXSTYLE)
+                    if not (int(ex) & WS_EX_TOPMOST):
+                        return           # 上面那个不是置顶窗口 → 我们本来就是最上面的，不用动
         except Exception:
             pass
         try:
@@ -10750,6 +11094,18 @@ class PetWindow(QWidget):
                 ctypes.c_void_p(-1),          # HWND_TOPMOST（必须按指针传，直接传 -1 会被截断）
                 0, 0, 0, 0,
                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+        # 这一抬会把饭碗挤到下面去（两个都是置顶窗），所以抬完立刻把碗重新摆到前面。
+        # 只在自己确实动过窗口时做，不用每帧折腾（主人 2026-10-16 反馈"拖动几下饭碗
+        # 就不见了"就是这条：桌宠一自抬，碗就沉下去，被身体盖住）。
+        self._rice_keep_above()
+
+    def _rice_keep_above(self):
+        """饭碗该在桌宠上面时，确保它真的排在前面（自己刚抬过窗口之后调用）。"""
+        try:
+            if getattr(self, "_rice_z_above", None) is True and not self._rice_wants_behind():
+                self._rice_set_above(True)
         except Exception:
             pass
 
@@ -10844,6 +11200,23 @@ SINGLE_INSTANCE_KEY = "dafeiyu-pet-whale-single-instance"
 # ===== 白饭碗：能拖走的饭碗，桌宠会追、平时抱着 ============================
 RICE_IMG = os.path.join(ASSET_DIR, "rice_bowl.png")
 RICE_HINT = "别抢我的大白饭！"
+# 饭碗换图层（桌宠上面 <-> 后面）的稳定期（秒），**默认 0 = 不拖**。
+# 历史：先是 0.35 秒、再压到 0.12 秒，主人都还觉得"转向背面有延迟"（1s → 0.5s）——
+# 这道延迟的每一毫秒都会被看见，因为桌宠已经转过去了、碗还留在原层。
+# 抖动的病根在**朝向**上（跟随鼠标时每帧翻），已经有 `_face_travel_follow` 的
+# 死区 + 最少 0.3 秒换向挡着，所以这里不再需要第二道延迟。
+# 真觉得晃，就把 config.json 的 `rice_z_settle` 设成 0.1~0.3 秒。
+RICE_Z_SETTLE_S = 0.0
+# "碗收到怀里"要求朝屏幕里走的这个朝向先稳住多久（秒）。
+# 跟随鼠标时朝向会在上下边界来回切，擦到一下 up 不该让碗整块挪进怀里又挪出来；
+# 稳够这么久才算真的转身，然后位置 + 图层同时切（零延迟，不会"碗到了怀里还在上层"）。
+RICE_CHEST_HOLD_S = 0.2
+# 饭碗跟桌宠一起动的放大倍数（精灵待机只摇 ±1.5px、呼吸只有 ±2%，照抄看不出来）。
+# 左右 2 倍 ≈ ±3px；呼吸 2.5 倍 ≈ ±5%（主人要的就是这个"跟着变小变大"）；
+# 走路时上下跟颠簸 2 倍。
+RICE_SWAY_GAIN = 2.0
+RICE_BOB_GAIN = 2.0
+RICE_BREATH_GAIN = 2.5
 
 
 class RiceBowl(QWidget):
@@ -10866,18 +11239,50 @@ class RiceBowl(QWidget):
         self._off = QPoint()
         self._pix = QPixmap(RICE_IMG)
         self._draw = QPixmap()
+        self._shown = None            # 当前实际绘制用的那份（跟着呼吸缩放）
+        self._base_side = 0
         self.apply_size(pet.cur_h)
 
     def apply_size(self, pet_h):
-        """碗跟着桌宠的档位一起缩放（约桌宠身高的 30%）。"""
+        """碗跟着桌宠的档位一起缩放（约桌宠身高的 30%）。
+
+        注意：**不锁死窗口尺寸**（原来是 setFixedSize）—— 呼吸缩放要每帧改大小，
+        固定尺寸就动不了了。锚点那边用 `_base_side` 算（不含呼吸），
+        否则碗的窗口一边缩放、锚点一边跟着变，会看到它在原地抽一下。
+        """
         side = max(26, int(pet_h * 0.30))
+        self._base_side = side
+        self._shown = None            # 让下一帧的呼吸缩放重新按新档位缩一份
         if self._pix.isNull():
             self._draw = QPixmap()
-            self.setFixedSize(side, side)
+            self.resize(side, side)
             return
         self._draw = self._pix.scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio,
                                       Qt.TransformationMode.SmoothTransformation)
-        self.setFixedSize(self._draw.size())
+        self.resize(self._draw.size())
+
+    def apply_breath(self, scale):
+        """呼吸缩放：窗口和图标一起放大/缩小（主人要的"和桌宠一起缩放"）。
+
+        **以底边中心为缩放中心**：精灵是绕着底边中心（脚）放大缩小的，
+        饭碗要是绕左上角放大，就会看着一边长一边往上飘。所以这里返回
+        (窗口变宽了多少的一半, 变高了多少)，让锚点把这点补回去 ——
+        碗就像贴在桌宠身上一起起伏。
+        用 `_base_side` 那一档原图现缩，所以不会一次比一次糊（不叠着缩）。
+        """
+        try:
+            if self._pix.isNull() or self._base_side <= 0:
+                return (0, 0)
+            side = max(8, int(round(self._base_side * float(scale))))
+            if self._shown is not None and side == self._shown.width():
+                return (0, 0)
+            self._shown = self._pix.scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation)
+            old_w, old_h = self.width(), self.height()
+            self.resize(self._shown.size())
+            return ((self._shown.width() - old_w) // 2, self._shown.height() - old_h)
+        except Exception:
+            return (0, 0)
 
     def ensure_ok(self, pet_h):
         """自愈：图标没加载出来、或者尺寸被搞成 0 时补上。返回 True 表示动过。"""
@@ -10891,8 +11296,9 @@ class RiceBowl(QWidget):
         return fixed
 
     def paintEvent(self, _ev):
-        if not self._draw.isNull():
-            QPainter(self).drawPixmap(0, 0, self._draw)
+        shown = self._shown if self._shown is not None else self._draw
+        if not shown.isNull():
+            QPainter(self).drawPixmap(0, 0, shown)
 
     # ---- 鼠标：只认拖动；点击不做任何事 ----
     def mousePressEvent(self, ev):

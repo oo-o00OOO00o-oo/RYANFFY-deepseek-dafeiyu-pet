@@ -352,20 +352,28 @@ pyinstaller --noconfirm --onefile --windowed --name 大肥鱼桌宠 --add-data "
 
 ### 打包成 Windows 安装包（中文安装向导，可自选安装位置）
 
-仓库里带了 Inno Setup 6 的脚本 `installer.iss`：
+仓库里带了 Inno Setup 6 的脚本 `installer.iss`。先装 Inno Setup 6
+（`winget install JRSoftware.InnoSetup`，或官网下载安装），然后用它的 `ISCC.exe`
+按**你本机的实际安装位置**编译：
 
 ```bash
-"F:\Codex\tools\innosetup\ISCC.exe" "/DMyAppVersion=1.0.13" installer.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=1.1.6" installer.iss
 ```
 
-产物在 `dist\大肥鱼桌宠-安装版-v1.0.13.exe`：双击是**中文向导**，中间那一步**能自己选安装位置**
+> **中文语言文件**：`installer.iss` 默认读仓库里的 `tools\ChineseSimplified.isl`。
+> 那个文件不在仓库里（Inno Setup 语言包有各自的授权），第一次打包时任选一种：
+> ① 从 Inno Setup 安装目录的 `Languages\` 里拷一份到仓库 `tools\` 下；
+> ② 从 [中文翻译仓库](https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation) 下 `ChineseSimplified.isl` 放进去；
+> ③ 或者传参指定现成的文件：
+> `ISCC.exe /DMyLangFile="D:\Inno Setup 6\Languages\ChineseSimplified.isl" /DMyAppVersion=1.1.6 installer.iss`。
+
+产物在 `dist\大肥鱼桌宠-安装版-v1.1.6.exe`：双击是**中文向导**，中间那一步**能自己选安装位置**
 （默认装到当前用户目录，不弹 UAC），自动建桌面/开始菜单快捷方式，**装完安装包本身就能删**，
 卸载走「设置 → 应用」。发版时用的脚本会把它的附件名固定成 `dafeiyu-pet-setup.exe` 再上传
 （中文文件名传到 GitHub 会变乱码，所以上传前复制一份英文名的）。
 
-> 一次性准备：`winget install JRSoftware.InnoSetup`，或者把 Inno Setup 解到 `F:\Codex\tools\innosetup`
-> （便携安装：`innosetup-x.y.z.exe /PORTABLE=1 /DIR=F:\Codex\tools\innosetup`），
-> 简体中文语言文件放 `F:\Codex\tools\innosetup-lang\ChineseSimplified.isl`。
+> 一次性准备：`winget install JRSoftware.InnoSetup`，装完记下 `ISCC.exe` 的实际路径
+> （一般在 `C:\Program Files (x86)\Inno Setup 6\`）；中文语言文件按上面的说明放进 `tools\`。
 
 小提示：如果你自己打包后启动报 `DLL load failed while importing QtCore`，是因为
 PyInstaller 把本机其它运行时里的 ICU（`icuuc.dll` / `icudt*.dll`）也打进了包，和 Qt 期望的

@@ -4,7 +4,40 @@
 新开对话默认从这里起步，所以需要长期保留的规则都写在这里，
 不要依赖某个超长对话的历史。
 
-## 这是什么
+## 环境事实（这台机器 · 2026-10-16 核实）
+
+**先说最容易踩的：这台机器没有 F 盘。** AGENTS.md 是从旧机器带过来的，
+以前写的 `F:\Codex\...` 那一整套现在**都不存在**。开工前按这张表找东西：
+
+| 东西 | 在哪 | 备注 |
+| --- | --- | --- |
+| 仓库 / 工作目录 | `D:\大肥鱼桌宠` | 从 GitHub 拉的（`origin` = RYANFFY/deepseek-dafeiyu-pet） |
+| Python | `.venv\Scripts\python.exe` | **3.13.9**；依赖：PySide6 6.12.0、requests 2.32.4、zstandard 0.25.0 |
+| 测试 / 排障脚本 | `D:\大肥鱼桌宠\_work\` | 已 gitignore；**不是** `F:\Codex\work` |
+| DSH（DeepSeek Harness） | `D:\dsh\DeepSeek Harness.exe` | 另一份 Electron 壳在 `D:\WorkBuddy\WorkBuddyAI\` |
+| DSH 会话日志 | `%USERPROFILE%\.dsh\sessions\**\session.v4.jsonl.zstd` | 状态条的数据源 |
+| **没有** F 盘 | —— | 旧的 `F:\Codex\tools\innosetup\ISCC.exe`、`F:\Codex\work\publish-pet.ps1` 全没了 |
+| **没有** PyInstaller | —— | `.venv` 里没装，`pyinstaller` 命令不存在 |
+| **没有** Inno Setup | —— | C 盘、D 盘标准位置都没找到 `ISCC.exe` |
+| **没有了** `publish-pet.ps1` | —— | 它本来就不在仓库里（在旧机器的 F 盘），跟着旧机器一起没了 |
+
+所以：**这台机器现在发不了版。** 别照着下面的发版流程硬跑 —— 打包机都没了。
+先跟主人说明"要发版得先装 PyInstaller + Inno Setup、并把发布脚本重建到 D 盘"，
+再动手（别自己悄悄换一套路径就发出去）。
+
+本机的两个权限坑（2026-10-16 实测）：
+
+- 工作区**子目录**（`_work/`、`sprites/`、`acl-recovery/` 这些）在 DSH 沙箱里
+  新建 / 写入文件会 `WinError 5 拒绝访问` —— 只有工作区**根目录**能写。
+  所以新写的测试脚本别往子目录里落临时文件；`_work/` 里的现成脚本
+  （`test_*.py`、`probe_*.py`）**读和改都正常**，能跑。
+  已知影响：`_work/test_dsh_status.py` 跑不动（它要往系统临时目录写文件）。
+- 真机探测 / Z 序这类测量**必须在真屏上跑**，不能用 `QT_QPA_PLATFORM=offscreen`：
+  offscreen 平台不支持 `raise_()/lower()/SetWindowPos`，量出来的置顶标志全是假的。
+  已经在屏幕上短暂弹出窗口的回归（比如 `_work/test_layer_menu.py`）会自己收摊，
+  不会影响正在跑的那只桌宠。
+
+## 是什么
 
 Windows 桌面宠物（Python + PySide6）。大肥鱼 / 小鲸鱼形象常驻桌面，
 显示 DeepSeek 余额、天气、当前播放的歌曲与歌词，带右键菜单、音效、开机自启、
@@ -13,17 +46,22 @@ Windows 桌面宠物（Python + PySide6）。大肥鱼 / 小鲸鱼形象常驻�
 ## 常用命令
 
 ```bash
-# 运行（开发）
+# 运行（开发）—— 在仓库根目录跑
 .venv\Scripts\pythonw.exe 桌宠.py      # 或直接双击 启动桌宠.bat
 
-# 依赖（需要 Python 3.11+）
-pip install -r requirements.txt
+# 依赖（venv 里已经装好上面那几个；换机器时）
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # 打包独立 exe —— 用 spec，不要手写参数（spec 里做了 ICU 过滤）
+# ⚠ 本机还没装 PyInstaller，要先：.venv\Scripts\python.exe -m pip install pyinstaller
 pyinstaller --noconfirm --clean 桌宠.spec
 
 # 打包中文安装包（Inno Setup 6）
-"F:\Codex\tools\innosetup\ISCC.exe" "/DMyAppVersion=1.0.x" installer.iss
+# ⚠ 本机没有 ISCC.exe（旧路径 F:\Codex\tools\innosetup\ 已随旧机器消失），
+#   要发版得先装 Inno Setup 6，然后按实际安装位置替换下面这行。
+#   脚本里的中文语言文件默认读仓库 tools\ChineseSimplified.isl，仓库里没有，
+#   第一次打包要按 README 的说明放一份，或传 /DMyLangFile="..."。
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=1.1.6" installer.iss
 ```
 
 产物在 `dist/`，不提交。发版流程见 `README.md` 的「改完代码怎么发版」：
@@ -45,8 +83,10 @@ pyinstaller --noconfirm --clean 桌宠.spec
 
 - 交流、注释、提交信息都用中文。commit 风格：`feat: …` / `fix: …` / `perf: …` + 中文说明。
 - 每次改动同步更新 `CHANGELOG.md`（写清改了什么、怎么验证）和 `TODO.md`。
-- **验证方式要落到实测**：离屏脚本用 `F:\Codex\work\test_*.py`，真机探测用 `probe_*.py`，
-  截图存 `shot_*.png` —— 这些放 `F:\Codex\work`，不要塞进仓库。
+- **验证方式要落到实测**：离屏脚本用 `test_*.py`，真机探测用 `probe_*.py`，
+  截图存 `shot_*.png` —— 这些放仓库根的 `_work\`（已 gitignore），不要塞进仓库。
+  （旧说明写的 `F:\Codex\work\` 在这台机器上不存在，见开头「环境事实」。）
+  真机 / 图层类的测量要在**真屏**上跑，不能用 offscreen，原因见开头。
 - 改动右键菜单（尤其新增二级菜单）后，必须用真鼠标点一遍子菜单。
 - `dist/` `build/` `.venv/` `__pycache__/` 以及运行时文件（`config.json`、`usage.json`、
   `lyrics_cache.json`、`menu-debug.log`）都不提交。
@@ -60,10 +100,19 @@ pyinstaller --noconfirm --clean 桌宠.spec
 - **打包报 `DLL load failed while importing QtCore`**：PyInstaller 把本机其它运行时的
   ICU 打进了包。用 `桌宠.spec`（已加过滤）而不是手写命令行。
 - **歌词**：网易云不报时间轴时按播放器时间对齐；切歌前不猜进度、失败不清空缓存。
-- `make_zip.py` 里的 `BASE` / `OUT` 还是旧机器路径（`D:\图图\大肥鱼\…`），
-  在当前位置要用得先改这两个常量。
+- `make_zip.py`（打源码分享 zip）**已经修好了**：原来 `BASE` / `OUT` 写死旧机器的
+  `D:\图图\大肥鱼\…`，现在按脚本自己所在位置取（BASE = 脚本目录），
+  zip 默认吐到**上一层**（不给环境变量时就是 `D:\大肥鱼桌宠_源码.zip`）；
+  想换地方用 `BIGFISH_ZIP_OUT=<zip 路径>`。实测 38 个文件 / 2.8 MB。
+  它只是"分享源码"用的，跟发版流程（安装包 + 微信 zip）不是一回事。
 
 ## 发版：主人说「推送 / 发布 / 发版」时怎么做
+
+> ⚠ **本机跑不了这套流程**（2026-10-16 核实）：`publish-pet.ps1` 不在仓库里，
+> 它跟着旧机器的 F 盘一起没了；PyInstaller 和 Inno Setup 这台机器也没装。
+> 主人说「推送」时：先如实说明"这台机器现在发不了版"，再说清缺什么
+> （装 PyInstaller + Inno Setup、把发布脚本重建到 D 盘），**别自己编一套路径硬发**。
+> 下面这套规矩本身没变，是**目标状态** —— 工具装回来就照它跑。
 
 主人 2026-09-13 定的规矩（原话）：
 > 之后如果我说推送等词，就把绿色安装版发送到 github 里，微信 zip 包留在之前一直放的文件夹里，
@@ -76,24 +125,26 @@ pyinstaller --noconfirm --clean 桌宠.spec
    - **有改动** → 跑 `publish-pet.ps1`（自动：提交 → 推送 → 打包 → 发新版 Release）
    - **没改动、但当前版本的 Release 还没发** → 加 `-Force` 跑，否则等于什么都没做
    - **没改动、Release 也发过了** → 直接回主人「内容没变，不重发」，别硬发新版
-2. 命令（脚本在 `F:\Codex\work\publish-pet.ps1`，**不在仓库里**，所以改它不用发版）：
+2. 命令（脚本**不在仓库里**，所以改它不用发版；旧位置 `F:\Codex\work\publish-pet.ps1`
+   已随旧机器消失，重建时建议放 `D:\Codex\work\`，建好把实际路径写回这里）：
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File F:\Codex\work\publish-pet.ps1 `
+   powershell -NoProfile -ExecutionPolicy Bypass -File <发布脚本实际路径>\publish-pet.ps1 `
      -Message "feat: 中文说明" [-Force]
    ```
 3. **Release 里只放** `dafeiyu-pet-setup.exe`（Windows 中文安装包，能选安装位置）——
    主人 2026-09-13 要求「GitHub 里 exe 文件就给 windows 安装版就可以了，有这个版本的就只留这个，
    没有的不用变更」：**绿色版不再上传**（v1.0.12 及更早本来就只有绿色版，保持原样没动）；
    真没编出安装包时才兜底发绿色版。
-4. **微信 zip 不上传**，只做在本地（主人要求「在本地给我」）：
-   `F:\Codex\2026-09-11\deepseek-harness-dsh-ai-harness-deepseek\outputs\大肥鱼桌宠-vX.Y.Z-微信版.zip`
+4. **微信 zip 不上传**，只做在本地（主人要求「在本地给我」）。
+   旧路径 `F:\Codex\2026-09-11\...\outputs\大肥鱼桌宠-vX.Y.Z-微信版.zip` 已随 F 盘消失，
+   重建发布脚本时放 `D:\Codex\work\outputs\` 之类，并把新路径写回这里。
    - **zip 里就两样**（主人 2026-09-13 要求：「就是把 windows 安装版和教程打包就可以，其他不需要」；
      后来又批注「对换回安装版，之后的也都是只保留安装版」）：
      `大肥鱼桌宠/大肥鱼桌宠-安装版-vX.Y.Z.exe`（Windows 安装版）+ `大肥鱼桌宠/使用说明.txt`（教程，
      按"先装再用"写）。**不放绿色版、不放源码、不放别的东西**（`publish-pet.ps1` 里 `New-WechatZip` 已经这么做了）。
    - **回复里要给能直接点的链接**（主人 2026-09-13 要求「之后都给我一个可以直接点的链接」）：
-     写成 Markdown 链接，别用 `代码块`/纯文本把路径括起来：
-     `[大肥鱼桌宠-vX.Y.Z-微信版.zip](F:/Codex/2026-09-11/deepseek-harness-dsh-ai-harness-deepseek/outputs/大肥鱼桌宠-vX.Y.Z-微信版.zip)`
+     写成 Markdown 链接，别用 `代码块`/纯文本把路径括起来，例如重建后：
+     `[大肥鱼桌宠-vX.Y.Z-微信版.zip](D:/Codex/work/outputs/大肥鱼桌宠-vX.Y.Z-微信版.zip)`
    - 只想补做 zip：`publish-pet.ps1 -ZipOnly -Version X.Y.Z`
 5. 版本号规则（2026-09-14 主人改的，原话：
    > 「之后迭代就每20一版吧，比如1.2.0的上一版是1.1.19」
@@ -105,8 +156,9 @@ pyinstaller --noconfirm --clean 桌宠.spec
    保持连续、不跳号，内容没变不重发。
    另：界面里显示的版本号在 `ui_console.py` 的 `APP_VERSION`，
    发版时**要跟版本号一起改**（关于页和侧边栏底部都读它）。
-6. 打包用 `桌宠.spec`（别手写 PyInstaller 参数），安装包用
-   `F:\Codex\tools\innosetup\ISCC.exe /DMyAppVersion=X.Y.Z installer.iss`。
+6. 打包用 `桌宠.spec`（别手写 PyInstaller 参数）；安装包用 Inno Setup 6 的 `ISCC.exe`，
+   按本机实际安装位置调用（原 `F:\Codex\tools\innosetup\ISCC.exe` 已消失）：
+   `"<Inno Setup 6 安装目录>\ISCC.exe" /DMyAppVersion=X.Y.Z installer.iss`。
 7. **Release 说明怎么写**（主人 2026-09-13：「现在就改，减少不必要的文案，1.0.15 的就很好」）：
    顺序是 **标题 → `## 这一版改了什么`（用户视角的 `###` 小节）→ `## 下载` → 最后一句
    「每一项的实测数据都写在仓库的 CHANGELOG.md 里。」**，像 v1.0.15 那样。

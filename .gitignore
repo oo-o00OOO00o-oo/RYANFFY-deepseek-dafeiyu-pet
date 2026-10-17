@@ -10,6 +10,10 @@ dsh-debug.log
 # 本地测试 / 排障脚本与截图（这台机器没有 F:\Codex\work，放这里）
 _work/
 
+# 文件权限排障时留下的备份与报告（acl-recovery/acl-report-*.jsonl 之类）
+acl-recovery/
+tmp/
+
 # 虚拟环境
 .venv/
 
@@ -23,3 +27,7 @@ __pycache__/
 
 # 运行时自动合成的音效（由 assets 里的分段 wav 拼出来）
 assets/click-*.wav
+
+# �ύ˵���õ���ʱ�ļ�
+_commit_msg.txt
+
