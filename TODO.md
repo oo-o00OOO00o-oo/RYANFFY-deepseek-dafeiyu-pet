@@ -1,5 +1,32 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-17 19:4x：气泡和字体重做）
+
+主人原话：
+
+> 「你能加一个气泡和字体样式吗，现在的太丑了」
+
+- 台词气泡：圆角 15、**弧形尾巴**（`bubble_path()`：圆角矩形 united 一条 quadTo 尾巴，
+  比直三角柔和）、底下淡投影（偏移 2px 画一遍）、1px 极细描边。
+- 字体：`_bubble_fonts()` 三档（正文 / 小字 / 标签），统一
+  `PreferFullHinting`，行距 +2；正文 10.5pt Medium，标签 DemiBold。
+- **避头标点**：新 `_wrap_cjk()` —— ！？，。 这类不许出现在行首（原来"哦！"会被拆行）。
+- 问答卡片 `_paint_question_card()`：标题行（左边标题+第几题，右边蓝色「点我去回答 →」）、
+  题面、选项胶囊。**先排版再验高度**：`(4,3)/(3,3)/(3,2)/(2,2)/(2,1)` 依次试，
+  取第一个不超过 `BUBBLE_H-2` 的方案，超出的选项写"还有 N 个选项…"。
+- `BUBBLE_INK` 两套主题各加 8 个键：`edge/shadow/card_hdr/card_q/chip_bg/chip_edge/chip_fg/card_foot`。
+- 踩的坑：
+  1. `_bubble_mode()` 只认 `bubble_text`，卡片只设 `bubble_card` 时**整张卡片不显示** ——
+     已改成 `(bubble_text or bubble_card)`。
+  2. 卡片一开始按最大内容排，height 远超气泡区（112px），**压在她头上**；
+     现在是"先排版再验高度"。气泡区实际可用高度 ≈ `BUBBLE_H + MARGIN - 22`（约 100px）。
+  3. 离屏渲染没有字体表（显示成 □），`_shot_bubble.py` 里手动
+     `QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")` 才看得到真实效果。
+  4. `❓` 在只有雅黑的离屏环境里是豆腐块 —— 卡片标题里去掉了它（状态条那行仍用 ❗/❓，
+     真机有 emoji 回退，显示正常）。
+- 实测：`test_expr_question.py` 37 项（气泡相关断言从 `bubble_text` 改成 `bubble_card`）、
+  动画 49、图层 20、饭碗 12、朝向 17、三视图 25 全过；四张对照图人工确认。
+
 ## v1.1.6 追加（2026-10-17 19:0x：状态表情 + 问答气泡 + 图片分文件夹）
 
 主人 2026-10-17 的要求（原话）：

@@ -39,7 +39,8 @@ from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice
                             QEventLoop, QSize, QFileInfo, QEvent, QAbstractNativeEventFilter,
                             QObject)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
-                           QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen)
+                           QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen,
+                           QPainterPath)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
@@ -526,6 +527,15 @@ BUBBLE_INK = {
         "ly_head": QColor(140, 148, 168),          # 歌词气泡：应用·歌名 / 当前句 / 下一句
         "ly_main": QColor(38, 44, 66),
         "ly_next": QColor(158, 158, 172),
+        # 问答卡片（2026-10-17 加的）：描边 / 阴影 / 小标题 / 选项胶囊 / 底部提示
+        "edge": QColor(24, 40, 90, 26),
+        "shadow": QColor(20, 30, 60, 30),
+        "card_hdr": QColor(96, 108, 150),
+        "card_q": QColor(38, 44, 66),
+        "chip_bg": QColor(240, 243, 250, 245),
+        "chip_edge": QColor(96, 120, 180, 40),
+        "chip_fg": QColor(64, 74, 104),
+        "card_foot": QColor(88, 118, 190),
     },
     "dark": {
         "bg": QColor(31, 35, 49, 246),
@@ -538,6 +548,14 @@ BUBBLE_INK = {
         "ly_head": QColor(151, 157, 178),
         "ly_main": QColor(233, 235, 244),
         "ly_next": QColor(128, 135, 160),
+        "edge": QColor(255, 255, 255, 30),
+        "shadow": QColor(0, 0, 0, 90),
+        "card_hdr": QColor(146, 160, 200),
+        "card_q": QColor(233, 235, 244),
+        "chip_bg": QColor(48, 54, 74, 240),
+        "chip_edge": QColor(140, 170, 230, 46),
+        "chip_fg": QColor(206, 214, 236),
+        "card_foot": QColor(150, 186, 255),
     },
 }
 # 余额气泡里"现在高峰 / 空闲"那行的颜色（深色底上得亮一点才看得清）
@@ -4021,6 +4039,31 @@ def click_through_style(style, on, user_passthrough=False):
     return style & ~WS_EX_TRANSPARENT
 
 
+def ellipsize(fm, text, max_w):
+    """太长就截成"…"：气泡窗口很窄，长选项必须收着显示。"""
+    if fm.horizontalAdvance(text) <= max_w:
+        return text
+    cut = len(text)
+    while cut > 1 and fm.horizontalAdvance(text[:cut] + "…") > max_w:
+        cut -= 1
+    return text[:cut] + "…"
+
+
+def bubble_path(rect, radius, tail_cx, tail_h):
+    """气泡轮廓：圆角矩形 + 底部一条**带弧度的**小尾巴（比直三角柔和得多）。"""
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    tail = QPainterPath()
+    tw = max(10.0, min(18.0, rect.height() * 0.5))
+    cx = max(rect.left() + radius + tw, min(rect.right() - radius - tw, tail_cx))
+    bottom = rect.bottom() - 0.5
+    tail.moveTo(cx - tw / 2.0, bottom)
+    tail.quadTo(cx - tw * 0.12, bottom + tail_h * 1.15, cx, bottom + tail_h)
+    tail.quadTo(cx + tw * 0.12, bottom + tail_h * 1.15, cx + tw / 2.0, bottom)
+    tail.closeSubpath()
+    return path.united(tail)
+
+
 def wrap_text(fm, text, max_w):
     """按像素宽度折行：中文逐字折，英文整词折（别把单词劈两半）。"""
     lines, cur = [], ""
@@ -4699,6 +4742,7 @@ class PetWindow(QWidget):
         self.bubble_text = ""
         self.bubble_until = 0
         self.bubble_inner = False
+        self.bubble_card = None        # 问答卡片（有它就不画普通台词气泡）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -6657,40 +6701,10 @@ class PetWindow(QWidget):
                 self.setCursor(Qt.CursorShape.ArrowCursor)
         if mode == "text":
             ink = self._bubble_ink()
-            if self.bubble_inner:
-                bfont = QFont(self.bubble_font)
-                bfont.setItalic(True)
-                bg, fg = ink["inner_bg"], ink["inner_fg"]
+            if self.bubble_card:
+                self._paint_question_card(p, ink)
             else:
-                bfont = QFont(self.bubble_font)
-                bg, fg = ink["bg"], ink["fg"]
-            fm = QFontMetrics(bfont)
-            max_w = min(240, self.width() - 16)
-            words = self.bubble_text
-            lines = []
-            cur = ""
-            for ch in words:
-                if fm.horizontalAdvance(cur + ch) > max_w - 20:
-                    lines.append(cur)
-                    cur = ch
-                else:
-                    cur += ch
-            lines.append(cur)
-            bw = max(fm.horizontalAdvance(l) for l in lines) + 28
-            bh = len(lines) * fm.height() + 16
-            bx = (self.width() - bw) / 2
-            by = self._bubble_top(bh)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(bg)
-            p.drawRoundedRect(QRectF(bx, by, bw, bh), 14, 14)
-            tail = QPointF(self.width() / 2, by + bh)
-            p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 7, tail.y() + 9),
-                                     QPointF(tail.x() + 7, tail.y() + 9)]))
-            p.setPen(fg)
-            p.setFont(bfont)
-            for i, l in enumerate(lines):
-                p.drawText(QRectF(bx, by + 8 + i * fm.height(), bw, fm.height()),
-                           Qt.AlignmentFlag.AlignCenter, l)
+                self._paint_note_bubble(p, ink)
         elif mode == "balance":
             # 余额气泡：余额 / 今日已用（数字带滚动动画）
             ink = self._bubble_ink()
@@ -6803,6 +6817,168 @@ class PetWindow(QWidget):
         """气泡贴着鱼头顶：尾巴尖落在精灵上沿附近。"""
         return max(2.0, BUBBLE_H + MARGIN - 10 - bh)
 
+    # ---------- 气泡外观（2026-10-17 重画：圆角 + 投影 + 细描边 + 小尾巴） ----------
+    def _bubble_fonts(self, base=10):
+        """气泡用的三档字（正文 / 小字 / 更小），统一 PreferFullHinting，中文不糊。"""
+        def mk(pt, weight=QFont.Weight.Normal, italic=False):
+            f = QFont(self.bubble_font)
+            f.setPointSizeF(pt)
+            f.setWeight(weight)
+            f.setItalic(italic)
+            f.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+            return f
+        return (mk(base, QFont.Weight.Medium),                    # 正文
+                mk(base - 1.5, QFont.Weight.Normal),              # 小字
+                mk(base - 2.0, QFont.Weight.DemiBold))            # 标签（标题/按钮）
+
+    def _wrap_cjk(self, fm, text, max_w):
+        """按像素折行 + 中文避头标点：不让 ！？，。 这些跑到行首（丑）。"""
+        lines, cur = [], ""
+        for ch in (text or ""):
+            if cur and fm.horizontalAdvance(cur + ch) > max_w:
+                if ch in "，。！？；：、）】》」”’～…":
+                    cur += ch          # 标点挤在上一行，宁可稍微超一点
+                    continue
+                lines.append(cur)
+                cur = ch
+            else:
+                cur += ch
+        lines.append(cur)
+        return lines
+
+    def _paint_note_bubble(self, p, ink):
+        """普通台词气泡：柔和投影 + 细描边 + 圆角小尾巴，行距比原来松一点。"""
+        inner = self.bubble_inner
+        f_main, _f_small, _f_tag = self._bubble_fonts(10.5)
+        if inner:
+            f_main.setItalic(True)
+        bg = ink["inner_bg"] if inner else ink["bg"]
+        fg = ink["inner_fg"] if inner else ink["fg"]
+        fm = QFontMetrics(f_main)
+        max_w = min(248, self.width() - 10)
+        lines = self._wrap_cjk(fm, self.bubble_text, max_w - 26)
+        line_h = fm.height() + 2
+        pad_x, pad_y = 14, 9
+        bw = max(max(fm.horizontalAdvance(l) for l in lines) + pad_x * 2, 52)
+        bw = min(bw, self.width() - 6)
+        bh = len(lines) * line_h + pad_y * 2 - 2
+        bx = (self.width() - bw) / 2
+        by = self._bubble_top(bh + 10)
+        rect = QRectF(bx, by, bw, bh)
+        path = bubble_path(rect, 15, self.width() / 2.0, 10)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink["shadow"])
+        p.save()
+        p.translate(0, 2)
+        p.drawPath(path)
+        p.restore()
+        p.setBrush(bg)
+        p.drawPath(path)
+        p.setPen(QPen(ink["edge"], 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.setPen(fg)
+        p.setFont(f_main)
+        for i, l in enumerate(lines):
+            p.drawText(QRectF(bx, by + pad_y + i * line_h, bw, line_h),
+                       Qt.AlignmentFlag.AlignCenter, l)
+
+    def _paint_question_card(self, p, ink):
+        """DSH 提问卡片：标题 + 题面 + 选项胶囊 + 右下角"点我去回答"。
+
+        窗口只有 168~200 宽、气泡区只有 BUBBLE_H 高，所以**先排版再验高度**：
+        放不下就先砍题面行数、再砍选项个数，保证卡片不会压到她头上。
+        """
+        card = self.bubble_card or {}
+        header = card.get("header") or "她在问你"
+        text = card.get("text") or ""
+        opts = card.get("options") or []
+        total = int(card.get("total") or 1)
+        index = int(card.get("index") or 1)
+        f_q, f_small, f_tag = self._bubble_fonts(9.0)
+        f_opt, f_hdr = f_small, f_tag
+        fm_h, fm_q, fm_o = QFontMetrics(f_hdr), QFontMetrics(f_q), QFontMetrics(f_opt)
+        pad_x, pad_y = 11, 6
+        bw = self.width() - 6.0
+        inner_w = bw - pad_x * 2
+        head = header
+        if total > 1:
+            head += "  %d/%d" % (index, total)
+        head = ellipsize(fm_h, head, inner_w - 54)      # 右边给"点我去回答"留位
+        line_h = fm_q.height() + 1
+        chip_h = fm_o.height() + 3
+        limit = BUBBLE_H - 2.0
+        all_q = self._wrap_cjk(fm_q, text, inner_w)
+        plan = None
+        for n_q, n_o in ((4, 3), (3, 3), (3, 2), (2, 2), (2, 1)):
+            q_lines = all_q[:n_q]
+            shown = opts[:n_o]
+            more = len(opts) - len(shown)
+            h = (pad_y * 2 + fm_h.height() + 4 + len(q_lines) * line_h
+                 + (2 if shown else 0) + len(shown) * (chip_h + 2)
+                 + (fm_o.height() if more else 0))
+            plan = (q_lines, shown, more, h)
+            if h <= limit:
+                break
+        q_lines, shown, more, bh = plan
+        if len(all_q) > len(q_lines) and q_lines:
+            q_lines[-1] = ellipsize(fm_q, q_lines[-1] + "…", inner_w)
+        bx = (self.width() - bw) / 2
+        by = self._bubble_top(bh + 10)
+        rect = QRectF(bx, by, bw, bh)
+        path = bubble_path(rect, 16, self.width() / 2.0, 10)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink["shadow"])
+        p.save()
+        p.translate(0, 2)
+        p.drawPath(path)
+        p.restore()
+        p.setBrush(ink["bg"])
+        p.drawPath(path)
+        p.setPen(QPen(ink["edge"], 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        x0 = bx + pad_x
+        y = by + pad_y
+        # 第一行：左边小标题，右边"点我去回答"
+        p.setFont(f_hdr)
+        p.setPen(ink["card_hdr"])
+        p.drawText(QRectF(x0, y, inner_w - 54, fm_h.height()),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, head)
+        p.setPen(ink["card_foot"])
+        p.drawText(QRectF(x0, y, inner_w, fm_h.height()),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   "点我去回答 →")
+        y += fm_h.height() + 4
+        p.setFont(f_q)
+        p.setPen(ink["card_q"])
+        for l in q_lines:
+            p.drawText(QRectF(x0, y, inner_w, line_h),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, l)
+            y += line_h
+        if shown:
+            y += 4
+        for opt in shown:
+            chip = QRectF(x0, y, inner_w, chip_h)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(ink["chip_bg"])
+            p.drawRoundedRect(chip, 7, 7)
+            p.setPen(QPen(ink["chip_edge"], 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(chip, 7, 7)
+            p.setPen(ink["chip_fg"])
+            p.setFont(f_opt)
+            p.drawText(chip.adjusted(7, 0, -5, 0),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       ellipsize(fm_o, opt, inner_w - 14))
+            y += chip_h + 3
+        if more > 0:
+            p.setPen(ink["card_hdr"])
+            p.setFont(f_opt)
+            p.drawText(QRectF(x0, y, inner_w, fm_o.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       "还有 %d 个选项…" % more)
+
     def _secs(self):
         """内部时钟（秒）。按当前每帧时长换算，两种流畅度下动作速度一致。"""
         return self.t * self.tick_ms / 1000.0
@@ -6812,7 +6988,7 @@ class PetWindow(QWidget):
 
         放歌时歌词优先于「余额常显」——想瞄一眼余额就快速双击（显示 5 秒）。
         """
-        if self.bubble_text and now < self.bubble_until:
+        if (self.bubble_text or self.bubble_card) and now < self.bubble_until:
             return "text"
         if self.now_playing and now < self._bal_peek_until and self.balance is not None:
             return "balance"
@@ -8427,6 +8603,7 @@ class PetWindow(QWidget):
                 return
         self.last_line = text
         self.bubble_inner = inner
+        self.bubble_card = None          # 说普通话就把问答卡片收掉
         self.bubble_text = f"（{text}）" if inner else text
         self.bubble_until = self._secs() + seconds
         if not idle:
@@ -8981,19 +9158,19 @@ class PetWindow(QWidget):
         text = q.get("text") or "有个问题要问你"
         total = q.get("total") or 1
         opts = q.get("options") or []
-        parts = []
-        if total > 1:
-            parts.append("第 %d/%d 题·%s" % (q.get("index") or 1, total, head) if head
-                         else "第 %d/%d 题" % (q.get("index") or 1, total))
-        elif head:
-            parts.append(head)
-        parts.append(text)
-        if opts:
-            short = [o if len(o) <= 14 else o[:13] + "…" for o in opts[:3]]
-            more = "…" if len(opts) > 3 else ""
-            parts.append("（%s%s）" % (" / ".join(short), more))
-        parts.append("点我去回答")
-        self.say("，".join(parts), seconds=14.0, queue=True)
+        # 画成卡片：小标题 / 题面 / 选项胶囊 / "点我去回答"
+        self.bubble_card = {
+            "header": head,
+            "text": text,
+            "options": opts,
+            "total": total,
+            "index": q.get("index") or 1,
+        }
+        self.bubble_text = ""
+        self.bubble_inner = False
+        self.bubble_until = self._secs() + 14.0
+        self._trigger_until = self._secs() + 14.0
+        self.update()
 
     def _open_dsh_for_question(self):
         """点桌宠 → 把 DSH 叫到前面去答题（不新开窗口）。"""
