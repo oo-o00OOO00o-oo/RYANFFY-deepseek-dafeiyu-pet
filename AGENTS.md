@@ -11,7 +11,11 @@
 
 | 东西 | 在哪 | 备注 |
 | --- | --- | --- |
-| 仓库 / 工作目录 | `D:\大肥鱼桌宠` | 从 GitHub 拉的（`origin` = RYANFFY/deepseek-dafeiyu-pet） |
+| 仓库 / 工作目录 | `D:\大肥鱼桌宠` | GitHub：`git@github.com:oo-o00OOO00o-oo/RYANFFY-deepseek-dafeiyu-pet.git`（**2026-10-17 重新接的**，旧地址 `RYANFFY/deepseek-dafeiyu-pet` 已不存在） |
+| 主干分支 | `main` | 远端同名；`git push -u origin main` 已设好 upstream |
+| SSH 认证 | `C:\Users\16050\.ssh\github_oslab` | 从 WSL `~/.ssh/github_oslab` 复制的 ed25519 私钥，指纹 `SHA256:k/tUZhYXeGJrvuVQmQTwB9K3t2emGXn7ykquv7JmV3k`（GitHub 账号 `oo-o00OOO00o-oo`）；`~/.ssh/config` 里已给 github.com 指定它 |
+| Git TLS 后端 | 全局 `http.sslBackend=openssl` | **本机 schannel 是坏的**（`SEC_E_NO_CREDENTIALS`），不改这个连 `git ls-remote` 都过不去 |
+| Git 凭证 | 全局 `credential.helper=wincred` | 老的 HTTPS 密码凭证已失效，**现在只走 SSH**，不要再用 https 地址 |
 | Python | `.venv\Scripts\python.exe` | **3.13.9**；依赖：PySide6 6.12.0、requests 2.32.4、zstandard 0.25.0 |
 | 测试 / 排障脚本 | `D:\大肥鱼桌宠\_work\` | 已 gitignore；**不是** `F:\Codex\work` |
 | DSH（DeepSeek Harness） | `D:\dsh\DeepSeek Harness.exe` | 另一份 Electron 壳在 `D:\WorkBuddy\WorkBuddyAI\` |
