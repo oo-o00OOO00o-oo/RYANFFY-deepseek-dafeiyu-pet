@@ -31,3 +31,11 @@ assets/click-*.wav
 # 提交说明用的临时文件
 _commit_msg.txt
 
+
+# 拉下来参考的第三方插件包（临时）
+_pkg/
+
+
+# pnpm 临时 store（拉包时生成）
+.pnpm-store/
+
