@@ -39,3 +39,8 @@ _pkg/
 # pnpm 临时 store（拉包时生成）
 .pnpm-store/
 
+
+# 自查渲染出来的临时截图
+_bubble_*.png
+_shot_*.png
+
