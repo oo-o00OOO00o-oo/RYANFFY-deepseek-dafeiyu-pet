@@ -189,6 +189,27 @@ else:
     PYTHONW = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
     USER_DIR = APP_DIR
 SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
+# 图片按用途分文件夹（主人 2026-10-17 要求，照插件那套组织）：
+#   base/ 正面侧面背面 · idle/ 待机眨眼 · walk_side/ 侧向行走 · walk_back/ 背影行走 · expr/ 表情
+# 加载按这个顺序找；根目录也查一遍，老布局（图片直接摊在 sprites/ 下）照样能用。
+SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "expr", "")
+
+
+def sprite_file(name):
+    """sprites 下按名字找图片（依次查子目录）；找不到返回 None。
+
+    传 "正面" 或 "正面.png" 都行（调用方有的带扩展名）。
+    """
+    if name.lower().endswith(".png"):
+        name = name[:-4]
+    for sub in SPRITE_SUBDIRS:
+        p = os.path.join(SPRITE_DIR, sub, name + ".png") if sub \
+            else os.path.join(SPRITE_DIR, name + ".png")
+        if os.path.exists(p):
+            return p
+    return None
+
+
 ASSET_DIR = os.path.join(BUNDLE_DIR, "assets")     # 音效 + 小鲸鱼挂件形象
 CONFIG_PATH = os.path.join(USER_DIR, "config.json")
 
@@ -1030,6 +1051,8 @@ def dsh_read_state(path):
     action = ""
     task = ""
     approvals = {}              # id -> {"id", "tool"}；decided 了就摘掉
+    questions = {}              # callId -> 解析好的提问（还没被回答的）
+    last_error = False
     for ln in lines:
         if '"type"' not in ln:
             continue
@@ -1045,15 +1068,30 @@ def dsh_read_state(path):
             step = 0
             action = ""
             approvals.clear()   # 新一轮开始，上一轮残留的审批不算数
+            questions.clear()
+            last_error = False
         elif t == "turn/end":
             working = False
             step = 0
             action = ""
             approvals.clear()
+            questions.clear()
         elif t == "step/start":
             step = d.get("step") or step
         elif t == "tool/call":
             action = DSH_TOOL_CN.get(d.get("name") or "", "在忙")
+            if d.get("name") == "ask_user_question":
+                q = _dsh_parse_question(d)
+                if q:
+                    questions[d.get("callId") or q.get("id") or "q"] = q
+        elif t == "tool/result":
+            msg = d.get("message") or {}
+            src = msg.get("source") or {}
+            cid = src.get("callId")
+            if cid:
+                questions.pop(cid, None)      # 这一问已经答完了
+            if msg.get("isError") or d.get("isError"):
+                last_error = True
         elif t == "user/message":
             try:
                 parts = d.get("content") or []
@@ -1070,7 +1108,45 @@ def dsh_read_state(path):
         elif t == "approval/decided":
             approvals.pop(d.get("id"), None)
     return {"working": working, "turn": turn, "step": step, "action": action,
-            "task": task, "approval": (list(approvals.values())[-1] if approvals else None)}
+            "task": task, "approval": (list(approvals.values())[-1] if approvals else None),
+            "question": (list(questions.values())[-1] if questions else None),
+            "error": last_error}
+
+
+def _dsh_parse_question(call):
+    """把 `ask_user_question` 的工具调用参数解析成一条好显示的提问。
+
+    参数形如 {"questions": [{id, header?, question, options?: [{label, description?}],
+    multi_select?}, ...]}（`arguments` 是 JSON 字符串）。
+    返回 {"id", "header", "text", "options": [label...], "multi": bool,
+          "index": 第几题（从 1 起）, "total": 一共几题}；解析不了返回 None。
+    """
+    try:
+        raw = call.get("arguments")
+        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        items = args.get("questions") or []
+        if not items:
+            return None
+        first = items[0] if isinstance(items[0], dict) else {}
+        opts = []
+        for op in (first.get("options") or []):
+            if isinstance(op, dict):
+                label = str(op.get("label") or "").strip()
+            else:
+                label = str(op).strip()
+            if label:
+                opts.append(label)
+        return {
+            "id": str(first.get("id") or call.get("callId") or ""),
+            "header": str(first.get("header") or "").strip(),
+            "text": str(first.get("question") or "").strip(),
+            "options": opts,
+            "multi": bool(first.get("multi_select")),
+            "index": 1,
+            "total": len(items),
+        }
+    except Exception:
+        return None
 
 
 # 双击之后留几秒"让位"：这几秒里的自言自语先憋着，别把刚弹出来的那一眼盖掉
@@ -1396,6 +1472,21 @@ WALK_FRAMES = {
     "侧面": ("侧面-2", "侧面", "侧面-3", "侧面"),
     "背面": ("背面", "背面-2", "背面-3", "背面-4"),
 }
+
+# ---------- 状态表情（照 DSH 插件那套改的，模型见 TODO/CHANGELOG） ----------
+# 桌宠当前"心情"，由 DSH 真实状态驱动：
+#   idle     闲着（默认）
+#   working  正在干活
+#   waiting  等你点头 / 等你回答（有审批或有提问）
+#   error    出错
+# 状态 → 表情帧；没有这张图就照常画方向图（不会报错）。
+PET_EXPR_FRAMES = {
+    "waiting": "着急",     # 等你点同意 / 等你回答时皱着眉
+    "dragging": "拖拽",    # 被你拎在手里拖
+    "error": "晕",         # 出错了：圈圈眼
+}
+PET_EXPR_PULSE_S = 2.6     # 一次性表情（比如"晕"）播多久
+PET_STATES = ("idle", "working", "waiting", "error")
 
 # 打开的某些应用时冒泡吐槽（进程名小写）
 PROCESS_LINES = {
@@ -4845,6 +4936,14 @@ class PetWindow(QWidget):
         self._dsh_busy = False         # 上一次还没读完就别再压一个线程
         self._dsh_running = False      # 上一次看到的"DSH 在不在跑"
         self._dsh_approval_seen = set()  # 冒过泡的审批 id（同一个审批只提醒一次）
+        # 状态表情（见 PET_EXPR_FRAMES）：DSH 在干什么 → 她什么表情
+        self._pet_state = "idle"       # idle / working / waiting / error
+        self._expr_pulse = None        # 一次性表情名（"error" 这种）
+        self._expr_pulse_until = 0.0
+        self._question = None          # 正在等你回答的问题（dict）或 None
+        self._question_seen = set()    # 已经冒过泡的问题 id，别反复刷屏
+        self._question_until = 0.0     # 气泡已经说到什么时候了
+        self._dsh_err_turn = -1        # 上一次播过"出错"表情的轮次
         if self.cfg.get("dsh_status_on", True):
             self._dsh_bar = DshStatusBar(self)
             self.dsh_timer = QTimer(self)
@@ -6193,11 +6292,11 @@ class PetWindow(QWidget):
                 h, Qt.TransformationMode.SmoothTransformation)
         name = SPRITE_VIEWS[view]
         # 自带素材正好有这个高度的现成文件（原来那五档就是）→ 直接用，省一次缩放
-        sized = os.path.join(SPRITE_DIR, f"{name}_{h}.png")
-        if os.path.exists(sized):
+        sized = sprite_file(f"{name}_{h}")
+        if sized:
             return QPixmap(sized)
-        full = os.path.join(SPRITE_DIR, f"{name}.png")
-        base = self._view_base(full)
+        full = sprite_file(name)
+        base = self._view_base(full) if full else None
         if base is None:
             return None
         return base.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
@@ -6210,10 +6309,12 @@ class PetWindow(QWidget):
         四帧外接框不一样，裁完再缩到同一高度就成了四个不同宽度，走路会横向抖
         （主人 2026-10-17 换上四帧背面行走图时踩到的）。
         """
-        sized = os.path.join(SPRITE_DIR, f"{name}_{h}.png")
-        if os.path.exists(sized):
+        sized = sprite_file(f"{name}_{h}")
+        if sized:
             return QPixmap(sized)
-        path = os.path.join(SPRITE_DIR, f"{name}.png")
+        path = sprite_file(name)
+        if not path:
+            return None
         if crop:
             base = self._view_base(path)
         else:
@@ -6226,6 +6327,19 @@ class PetWindow(QWidget):
     def _load_anxious_pixmap(self, h):
         """追饭碗时的「着急」表情：sprites/着急.png（没有这张图就跳过，追逐时仍用方向图）。"""
         return self._load_named_pixmap("着急", h)
+
+    def _load_expr_pixmaps(self, h):
+        """把状态表情（着急 / 晕 / 拖拽）一次性塞进 sprites；缺哪张就跳过。
+
+        和动画帧不一样：表情是整张图，**要裁透明边**（crop=True），
+        不然缩放后人物在窗口里会偏。
+        """
+        for frame in set(PET_EXPR_FRAMES.values()):
+            if (frame, h) in self.sprites:
+                continue
+            pix = self._load_named_pixmap(frame, h)
+            if pix is not None and not pix.isNull():
+                self.sprites[(frame, h)] = pix
 
     def _view_base(self, path):
         """某个视图"原图裁掉透明边"之后的那份，按「路径 + 修改时间」缓存。
@@ -6267,6 +6381,7 @@ class PetWindow(QWidget):
             anx = self._load_anxious_pixmap(h)      # 追饭碗的「着急」表情
             if anx is not None and not anx.isNull():
                 self.sprites[("着急", h)] = anx
+            self._load_expr_pixmaps(h)              # 状态表情（着急 / 晕 / 拖拽）
             for fn in ANIM_FRAMES:                  # 动画帧（眨眼 / 行走各帧）
                 pix = self._load_named_pixmap(fn, h, crop=False)
                 if pix is not None and not pix.isNull():
@@ -6307,6 +6422,7 @@ class PetWindow(QWidget):
             anx = self._load_anxious_pixmap(h)
             if anx is not None and not anx.isNull():
                 self.sprites[("着急", h)] = anx
+        self._load_expr_pixmaps(h)
         for fn in ANIM_FRAMES:
             if (fn, h) not in self.sprites:
                 pix = self._load_named_pixmap(fn, h, crop=False)
@@ -6988,15 +7104,54 @@ class PetWindow(QWidget):
         name = self._anim_frame_name(name)
         return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
 
-    def _anim_frame_name(self, name):
-        """帧动画：待机眨眼、行走换帧。帧图没加载就退回静态图（不报错）。
+    # ---------- 状态表情（照 DSH 插件那套"状态驱动"改的） ----------
+    def set_pet_state(self, state):
+        """DSH 在干什么 → 她什么表情。
 
+        只改"底色状态"，不影响走路/眨眼：真正换图在 `_pet_expr_frame` 里按
+        优先级取（一次性表情 > 被拖 > 状态 > 走路 > 待机）。
+        """
+        self._pet_state = state if state in PET_STATES else "idle"
+
+    def pulse_pet_expr(self, state, seconds=None):
+        """播一次"一次性表情"（比如出错时的圈圈眼），到点自动退回本色状态。"""
+        if state not in PET_EXPR_FRAMES:
+            return
+        self._expr_pulse = state
+        self._expr_pulse_until = self._secs() + (
+            PET_EXPR_PULSE_S if seconds is None else max(0.4, seconds))
+
+    def _pet_expr_frame(self):
+        """该画哪张表情图；没有对应的图就返回 None（照常画方向图）。"""
+        def have(state):
+            frame = PET_EXPR_FRAMES.get(state)
+            return frame if frame and (frame, self.cur_h) in self.sprites else None
+
+        if self._expr_pulse and self._secs() < self._expr_pulse_until:
+            f = have(self._expr_pulse)
+            if f:
+                return f
+        if self.dragging:
+            f = have("dragging")
+            if f:
+                return f
+        return have(self._pet_state)
+
+    def _anim_frame_name(self, name):
+        """帧动画：待机眨眼、行走换帧、状态表情。帧图没加载就退回静态图（不报错）。
+
+        优先级：**状态表情 > 行走帧 > 待机眨眼**。
+        - 状态表情：DSH 等你点头/回答 → 着急；出错过 → 圈圈眼（一次性）；
+          被你拖着 → 拖拽姿势（见 `PET_EXPR_FRAMES`，缺图自动跳过）
         - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
         - 侧面 / 背面：行走时按 `WALK_FRAMES[name]` 那一串循环
-          （侧面 10 帧、背面 4 帧，主人 2026-10-17 给的两套素材）。
+          （侧面 3 帧、背面 4 帧，主人 2026-10-17 给的素材）。
           步频仍是 WALK_LEG_S 一步（0.22 秒），一整个循环 = 两步 = 0.44 秒，
           帧序均匀铺在这段时间里；缺哪一帧就退回静态图，不会报错。
         """
+        expr = self._pet_expr_frame()
+        if expr:
+            return expr
         now = self._secs()
         if name == "正面":
             if now < self._blink_until and ("正面-眨", self.cur_h) in self.sprites:
@@ -8415,6 +8570,10 @@ class PetWindow(QWidget):
         看得见的部分是零延迟，只有那句可能在 0.3~0.8 秒内被撤销的话在等。
         """
         self.refresh_balance(silent=True)      # 点一下顺手刷新余额
+        # DSH 那边正等着你回答 → 这一下直接跳到 DSH（气泡上也写着"点我去回答"）
+        if getattr(self, "_question", None):
+            self._open_dsh_for_question()
+            return
         if self._music_playing():
             # 放歌时报"在放什么"，不用随机台词把歌词顶掉
             self.jump_t = 1.0
@@ -8755,12 +8914,34 @@ class PetWindow(QWidget):
             self._apply_dsh_state(state)
 
     def _apply_dsh_state(self, state):
-        """按最新状态决定状态条显示什么 —— 空闲 / DSH 没开就整条藏起来。"""
+        """按最新状态决定状态条 + 桌宠表情 —— 空闲 / DSH 没开就整条藏起来。
+
+        顺序有讲究：**提问 > 审批 > 干活 > 空闲**。提问时状态条写"等你回答"，
+        桌宠换成着急脸，气泡里带上题目和选项，点她一下直接跳到 DSH 去答。
+        """
         bar = self._dsh_bar
         if bar is None:
             return
-        ap = (state or {}).get("approval")
-        if state and self._dsh_running and ap:
+        live = bool(state) and self._dsh_running
+        q = (state or {}).get("question") if live else None
+        ap = (state or {}).get("approval") if live else None
+        # 这一轮里出过错 → 播一次"圈圈眼"（同一轮只播一次，别每 0.4 秒抖一下）
+        if live and state.get("error"):
+            turn = state.get("turn") or 0
+            if turn != getattr(self, "_dsh_err_turn", -1):
+                self._dsh_err_turn = turn
+                self.pulse_pet_expr("error")
+        # 提问没了（答完 / 被取消）就把气泡标记清掉，别让她一直挂着"点我去回答"
+        if not q and getattr(self, "_question", None):
+            self._question = None
+        if q:
+            self._question = q
+            self.set_pet_state("waiting")
+            bar.set_state("❓ 等你回答", "approval")
+            self._announce_question(q)
+        elif ap:
+            self._question = None
+            self.set_pet_state("waiting")
             bar.set_state("❗ 等你点同意", "approval")
             aid = ap.get("id")
             if aid not in self._dsh_approval_seen:
@@ -8770,11 +8951,15 @@ class PetWindow(QWidget):
                 tool = ap.get("tool") or "一个操作"
                 self.say(f"DSH 那边有个「{tool}」在等你点头哦，不去看看吗",
                          seconds=4.5, queue=True)
-        elif state and self._dsh_running and state.get("working"):
+        elif live and state.get("working"):
+            self._question = None
+            self.set_pet_state("working")
             step = max(1, state.get("step") or 1)
             action = state.get("action") or "在思考"
             bar.set_state(f"🐋 干活中 · 第 {step} 步 · {action}", "working")
         else:
+            self._question = None
+            self.set_pet_state("idle")
             bar.set_state("", "working")
             if bar.isVisible():
                 bar.hide()
@@ -8782,6 +8967,51 @@ class PetWindow(QWidget):
         if self.isVisible() and not bar.isVisible():
             bar.show()
         self._dsh_bar_follow(snap=True)
+
+    def _announce_question(self, q):
+        """把 DSH 正在问的问题冒出来（同一个问题只冒一次，别刷屏）。"""
+        qid = q.get("id") or ""
+        if qid and qid in self._question_seen:
+            return
+        if qid:
+            self._question_seen.add(qid)
+            if len(self._question_seen) > 40:
+                self._question_seen = set(list(self._question_seen)[-20:])
+        head = q.get("header") or ""
+        text = q.get("text") or "有个问题要问你"
+        total = q.get("total") or 1
+        opts = q.get("options") or []
+        parts = []
+        if total > 1:
+            parts.append("第 %d/%d 题·%s" % (q.get("index") or 1, total, head) if head
+                         else "第 %d/%d 题" % (q.get("index") or 1, total))
+        elif head:
+            parts.append(head)
+        parts.append(text)
+        if opts:
+            short = [o if len(o) <= 14 else o[:13] + "…" for o in opts[:3]]
+            more = "…" if len(opts) > 3 else ""
+            parts.append("（%s%s）" % (" / ".join(short), more))
+        parts.append("点我去回答")
+        self.say("，".join(parts), seconds=14.0, queue=True)
+
+    def _open_dsh_for_question(self):
+        """点桌宠 → 把 DSH 叫到前面去答题（不新开窗口）。"""
+        try:
+            info = dsh_probe()
+            if info.get("found"):
+                hwnd = int(info.get("hwnd") or 0)
+                if info.get("iconic"):
+                    ok = dsh_show_window(hwnd)
+                else:
+                    ok = dsh_raise_window(hwnd) or dsh_show_window(hwnd)
+                dsh_debug("question: 跳到 DSH hwnd=%#x ok=%s" % (hwnd, ok))
+            else:
+                ok = dsh_launch(self.cfg.get("dsh_path") or DSH_EXE)
+                dsh_debug("question: DSH 没开，拉起 ok=%s" % ok)
+        except Exception as exc:
+            dsh_debug("question: 跳转失败 %r" % (exc,))
+        self.say("去 DSH 那边回答吧～", seconds=2.5, again=True)
 
     def _dsh_bar_follow(self, snap=False):
         """把状态条贴到桌宠脚下（居中）；脚下出了屏幕就顶到桌宠头上。"""

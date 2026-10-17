@@ -1,5 +1,36 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-17 19:0x：状态表情 + 问答气泡 + 图片分文件夹）
+
+主人 2026-10-17 的要求（原话）：
+
+> 「你可以先把状态驱动表情的动画模型，桌面问答气泡（可以和我的进度条配合联系起来）做了，
+> 我觉得可用的素材留在那个文件夹了，不能用的删除了，我们的图片应该也要用文件夹分开」
+
+- **素材取舍**：主人把插件里其它动作全删了，只留 `dizzy`（晕）和 `dragging`（拖拽）两帧，
+  所以表情只做了这两个 + 原有的「着急」。
+- **状态表情**（`桌宠.py`）：
+  - `PET_EXPR_FRAMES = {waiting: 着急, dragging: 拖拽, error: 晕}`；
+  - `set_pet_state()` / `pulse_pet_expr()` / `_pet_expr_frame()`，
+    优先级 **一次性表情 > 拖拽 > 底色状态 > 走路 > 待机眨眼**（在 `_anim_frame_name` 最前面拦）；
+  - 驱动：`_apply_dsh_state()` 里按 `question > approval > working > idle` 设状态；
+    同一轮里 `tool/result` 带 isError 时播一次「晕」（用轮次去重，别每 0.4 秒抖一下）。
+- **问答气泡**：
+  - `dsh_read_state()` 多解析两样东西：`tool/call` 里 `ask_user_question` 的 `arguments`
+    （JSON 字符串 → 题面/选项/多题/标题，见 `_dsh_parse_question`），
+    以及 `tool/result` 里带 `callId` 的收尾（答完就把提问摘掉）；
+  - 有提问时状态条写「❓ 等你回答」（复用 approval 的红色），气泡冒一条
+    "第 X/Y 题·标题，题面，（选项…），点我去回答"；
+  - **点桌宠 → `_open_dsh_for_question()`** 把 DSH 窗口叫到前面（iconic 就先 show，否则 raise）。
+  - 注意：只能"看 + 跳过去"，**不能在这边作答** —— 作答要 DSH 的插件协议，
+    那个插件是靠 helper 跟宿主通信的，我们只读会话日志，没有回写通道。
+- **图片分文件夹**：`sprites/{base,idle,walk_side,walk_back,expr}/`，根上只留 `icon.png`；
+  新增 `sprite_file(name)`（依次查子目录，接受带不带 `.png`），
+  `_load_view_pixmap` / `_load_named_pixmap` 都走它 —— 老布局也能用。
+  **坑**：测试里原来写死 `os.path.join(SPRITE_DIR, fn)` 判存在，改目录后全挂；
+  已把三个测试改成 `pet.sprite_file(fn)`。
+- 新表情图是 238px 单档素材，按四档放大生成（340 那档会略软，可接受）。
+
 ## v1.1.6 追加（2026-10-17 18:32：白饭碗换新图）
 
 主人 2026-10-17 18:32 发了一张新饭碗图（1024×1024、绿底），原话：
