@@ -34,14 +34,16 @@
 > 「你可以先把状态驱动表情的动画模型，桌面问答气泡（可以和我的进度条配合联系起来）做了，
 > 我觉得可用的素材留在那个文件夹了，不能用的删除了，我们的图片应该也要用文件夹分开」
 
-- **素材取舍**：主人把插件里其它动作全删了，只留 `dizzy`（晕）和 `dragging`（拖拽）两帧，
-  所以表情只做了这两个 + 原有的「着急」。
+- **素材取舍**：主人把插件里其它动作全删了，只留 `dizzy`（晕）和 `dragging`（拖拽）两帧。
+  其中 **「晕」在 19:5x 又被主人点名删掉**（原话：「不要这个功能和表情」）——
+  `PET_EXPR_FRAMES` 里已经没有 error、`pulse_pet_expr()` 整个方法删了、
+  `sprites/expr/晕*.png` 四张已删、`dsh_read_state` 不再返回 `error` 字段。
+  以后别再往"出错表情"上加东西。
 - **状态表情**（`桌宠.py`）：
-  - `PET_EXPR_FRAMES = {waiting: 着急, dragging: 拖拽, error: 晕}`；
-  - `set_pet_state()` / `pulse_pet_expr()` / `_pet_expr_frame()`，
-    优先级 **一次性表情 > 拖拽 > 底色状态 > 走路 > 待机眨眼**（在 `_anim_frame_name` 最前面拦）；
-  - 驱动：`_apply_dsh_state()` 里按 `question > approval > working > idle` 设状态；
-    同一轮里 `tool/result` 带 isError 时播一次「晕」（用轮次去重，别每 0.4 秒抖一下）。
+  - `PET_EXPR_FRAMES = {waiting: 着急, dragging: 拖拽}`；
+  - `set_pet_state()` / `_pet_expr_frame()`，
+    优先级 **拖拽 > 底色状态 > 走路 > 待机眨眼**（在 `_anim_frame_name` 最前面拦）；
+  - 驱动：`_apply_dsh_state()` 里按 `question > approval > working > idle` 设状态。
 - **问答气泡**：
   - `dsh_read_state()` 多解析两样东西：`tool/call` 里 `ask_user_question` 的 `arguments`
     （JSON 字符串 → 题面/选项/多题/标题，见 `_dsh_parse_question`），

@@ -754,7 +754,11 @@ def dsh_show_window(hwnd=0):
         if u32.IsIconic(hwnd):
             u32.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化 -> 还原
         else:
-            u32.ShowWindow(hwnd, 4)          # SW_SHOWNOACTIVATE：显示但不抢焦点
+            # ⚠ 这里必须是**会激活窗口**的 SW_SHOW(5)，不能是 SW_SHOWNOACTIVATE(4)。
+            # 2026-10-17 实测过：用 SW_SHOWNOACTIVATE 把隐藏的 DSH 显示出来以后，
+            # 窗口是可见了，但系统不把它当活动窗口，Electron 的页面就一直"没醒" ——
+            # 表现就是主人报的「看不到能点的 DSH / 点什么都没反应」。
+            u32.ShowWindow(hwnd, 5)          # SW_SHOW：显示并激活
         if not u32.IsWindowVisible(hwnd):
             return False
         dsh_raise_window(hwnd)               # 说好的"看得到"就得真在前面
@@ -976,13 +980,27 @@ def dsh_raise_window(hwnd=0):
         if u32.IsIconic(hwnd):
             return False                                   # 最小化的不在"抬高"范围内
         u32.BringWindowToTop(hwnd)
-        if not u32.SetForegroundWindow(hwnd):
+        ok = bool(u32.SetForegroundWindow(hwnd))
+        if not ok:
             try:
                 # Win2000 起就有、至今还在用的"切到某个窗口"接口，逻辑在系统内部，
                 # 不会改我们自己的输入队列
                 ctypes.windll.user32.SwitchToThisWindow(wintypes.HWND(hwnd), True)
             except Exception:
                 pass
+        if u32.GetForegroundWindow() != hwnd:
+            # 前台锁没解开：系统只允许"刚被用户操作过"的进程抢前台。老办法是按一下
+            # Alt（立刻松开）把这条锁解掉，再抢一次 —— 它只往键鼠队列里塞一个
+            # "修饰键按下抬起"，不碰输入队列，也就不会重演 AttachThreadInput 那次的
+            # "DSH 整个点不动"（见上面那段警告）。
+            try:
+                u32.keybd_event(0x12, 0, 0, 0)
+                u32.keybd_event(0x12, 0, 2, 0)
+                ok = bool(u32.SetForegroundWindow(hwnd)) or ok
+            except Exception:
+                pass
+        dsh_debug("raise: ok=%s fg=%#x want=%#x"
+                  % (ok, int(u32.GetForegroundWindow() or 0), hwnd))
         return bool(u32.IsWindowVisible(hwnd))
     except Exception:
         return False
@@ -1070,7 +1088,6 @@ def dsh_read_state(path):
     task = ""
     approvals = {}              # id -> {"id", "tool"}；decided 了就摘掉
     questions = {}              # callId -> 解析好的提问（还没被回答的）
-    last_error = False
     for ln in lines:
         if '"type"' not in ln:
             continue
@@ -1087,7 +1104,6 @@ def dsh_read_state(path):
             action = ""
             approvals.clear()   # 新一轮开始，上一轮残留的审批不算数
             questions.clear()
-            last_error = False
         elif t == "turn/end":
             working = False
             step = 0
@@ -1108,8 +1124,6 @@ def dsh_read_state(path):
             cid = src.get("callId")
             if cid:
                 questions.pop(cid, None)      # 这一问已经答完了
-            if msg.get("isError") or d.get("isError"):
-                last_error = True
         elif t == "user/message":
             try:
                 parts = d.get("content") or []
@@ -1127,8 +1141,7 @@ def dsh_read_state(path):
             approvals.pop(d.get("id"), None)
     return {"working": working, "turn": turn, "step": step, "action": action,
             "task": task, "approval": (list(approvals.values())[-1] if approvals else None),
-            "question": (list(questions.values())[-1] if questions else None),
-            "error": last_error}
+            "question": (list(questions.values())[-1] if questions else None)}
 
 
 def _dsh_parse_question(call):
@@ -1501,10 +1514,8 @@ WALK_FRAMES = {
 PET_EXPR_FRAMES = {
     "waiting": "着急",     # 等你点同意 / 等你回答时皱着眉
     "dragging": "拖拽",    # 被你拎在手里拖
-    "error": "晕",         # 出错了：圈圈眼
 }
-PET_EXPR_PULSE_S = 2.6     # 一次性表情（比如"晕"）播多久
-PET_STATES = ("idle", "working", "waiting", "error")
+PET_STATES = ("idle", "working", "waiting")
 
 # 打开的某些应用时冒泡吐槽（进程名小写）
 PROCESS_LINES = {
@@ -4981,13 +4992,10 @@ class PetWindow(QWidget):
         self._dsh_running = False      # 上一次看到的"DSH 在不在跑"
         self._dsh_approval_seen = set()  # 冒过泡的审批 id（同一个审批只提醒一次）
         # 状态表情（见 PET_EXPR_FRAMES）：DSH 在干什么 → 她什么表情
-        self._pet_state = "idle"       # idle / working / waiting / error
-        self._expr_pulse = None        # 一次性表情名（"error" 这种）
-        self._expr_pulse_until = 0.0
+        self._pet_state = "idle"       # idle / working / waiting
         self._question = None          # 正在等你回答的问题（dict）或 None
         self._question_seen = set()    # 已经冒过泡的问题 id，别反复刷屏
         self._question_until = 0.0     # 气泡已经说到什么时候了
-        self._dsh_err_turn = -1        # 上一次播过"出错"表情的轮次
         if self.cfg.get("dsh_status_on", True):
             self._dsh_bar = DshStatusBar(self)
             self.dsh_timer = QTimer(self)
@@ -7289,24 +7297,12 @@ class PetWindow(QWidget):
         """
         self._pet_state = state if state in PET_STATES else "idle"
 
-    def pulse_pet_expr(self, state, seconds=None):
-        """播一次"一次性表情"（比如出错时的圈圈眼），到点自动退回本色状态。"""
-        if state not in PET_EXPR_FRAMES:
-            return
-        self._expr_pulse = state
-        self._expr_pulse_until = self._secs() + (
-            PET_EXPR_PULSE_S if seconds is None else max(0.4, seconds))
-
     def _pet_expr_frame(self):
         """该画哪张表情图；没有对应的图就返回 None（照常画方向图）。"""
         def have(state):
             frame = PET_EXPR_FRAMES.get(state)
             return frame if frame and (frame, self.cur_h) in self.sprites else None
 
-        if self._expr_pulse and self._secs() < self._expr_pulse_until:
-            f = have(self._expr_pulse)
-            if f:
-                return f
         if self.dragging:
             f = have("dragging")
             if f:
@@ -9102,12 +9098,6 @@ class PetWindow(QWidget):
         live = bool(state) and self._dsh_running
         q = (state or {}).get("question") if live else None
         ap = (state or {}).get("approval") if live else None
-        # 这一轮里出过错 → 播一次"圈圈眼"（同一轮只播一次，别每 0.4 秒抖一下）
-        if live and state.get("error"):
-            turn = state.get("turn") or 0
-            if turn != getattr(self, "_dsh_err_turn", -1):
-                self._dsh_err_turn = turn
-                self.pulse_pet_expr("error")
         # 提问没了（答完 / 被取消）就把气泡标记清掉，别让她一直挂着"点我去回答"
         if not q and getattr(self, "_question", None):
             self._question = None
