@@ -744,28 +744,9 @@ def dsh_show_window(hwnd=0):
         hwnd = dsh_main_hwnd()
     if not hwnd:
         return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-        u32 = ctypes.windll.user32
-        u32.IsWindowVisible.argtypes = [wintypes.HWND]
-        u32.IsWindowVisible.restype = wintypes.BOOL
-        u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        if u32.IsIconic(hwnd):
-            u32.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化 -> 还原
-        else:
-            # ⚠ 这里必须是**会激活窗口**的 SW_SHOW(5)，不能是 SW_SHOWNOACTIVATE(4)。
-            # 2026-10-17 实测过：用 SW_SHOWNOACTIVATE 把隐藏的 DSH 显示出来以后，
-            # 窗口是可见了，但系统不把它当活动窗口，Electron 的页面就一直"没醒" ——
-            # 表现就是主人报的「看不到能点的 DSH / 点什么都没反应」。
-            u32.ShowWindow(hwnd, 5)          # SW_SHOW：显示并激活
-        if not u32.IsWindowVisible(hwnd):
-            return False
-        dsh_raise_window(hwnd)               # 说好的"看得到"就得真在前面
-        return True
-    except Exception as exc:
-        dsh_debug("dsh_show_window: %r" % (exc,))
-        return False
+    # 显示 + 抢前台 + 唤醒（±1px 抖一下让 Electron 重新布局）都在 dsh_wake_window 里，
+    # 这里不再自己拼 ShowWindow —— 以前那版用 SW_SHOWNOACTIVATE，窗口出来了却点不动。
+    return dsh_wake_window(hwnd)
 
 
 def _dsh_tasklist_path():
@@ -945,6 +926,62 @@ def win_is_topmost(widget):
         ex = user32.GetWindowLongPtrW(ctypes.c_void_p(int(widget.winId())), -20)
         return bool(int(ex or 0) & 0x00000008)      # WS_EX_TOPMOST
     except Exception:
+        return False
+
+
+def dsh_wake_window(hwnd=0):
+    """把 DSH 叫到前面**并且让它能点**（2026-10-17 加）。
+
+    为什么不能只 ShowWindow：DSH 是 Electron。窗口被 hide 之后，
+    另一个进程直接 ShowWindow 让它重新可见，Chromium 那边的"窗口已显示"状态不一定跟上，
+    表现就是主人反复报的那句 —— **看得见，点什么都没反应**。
+    这里在"显示 + 抢前台"之后补两下**极小的尺寸变化**（±1px，肉眼看不见）：
+    Chromium 收到 WM_SIZE 会重新布局，输入链路跟着恢复，这是实测里唯一稳定的唤醒手段。
+
+    返回 True = 窗口可见且已经拿到前台。
+    """
+    if not hwnd:
+        hwnd = dsh_main_hwnd()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        r = wintypes.RECT()
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)                 # SW_RESTORE
+        elif not u32.IsWindowVisible(hwnd):
+            u32.ShowWindow(hwnd, 5)                 # SW_SHOW
+        else:
+            u32.ShowWindow(hwnd, 5)
+        u32.BringWindowToTop(hwnd)
+        if not u32.SetForegroundWindow(hwnd):
+            try:
+                ctypes.windll.user32.SwitchToThisWindow(wintypes.HWND(hwnd), True)
+            except Exception:
+                pass
+        if u32.GetForegroundWindow() != hwnd:
+            try:
+                u32.keybd_event(0x12, 0, 0, 0)      # 轻按 Alt 解锁前台锁
+                u32.keybd_event(0x12, 0, 2, 0)
+                u32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        # 唤醒渲染进程：±1px 的尺寸变化（不动位置、不动 Z 序）
+        if u32.GetWindowRect(hwnd, ctypes.byref(r)):
+            w, h = r.right - r.left, r.bottom - r.top
+            SWP = 0x0002 | 0x0001                   # NOMOVE | NOZORDER
+            u32.SetWindowPos(hwnd, 0, 0, 0, w, h + 1, SWP)
+            u32.SetWindowPos(hwnd, 0, 0, 0, w, h, SWP)
+        ok = bool(u32.IsWindowVisible(hwnd)) and u32.GetForegroundWindow() == hwnd
+        dsh_debug("wake: visible=%s fg=%#x want=%#x ok=%s"
+                  % (bool(u32.IsWindowVisible(hwnd)),
+                     int(u32.GetForegroundWindow() or 0), hwnd, ok))
+        return ok
+    except Exception as exc:
+        dsh_debug("dsh_wake_window: %r" % (exc,))
         return False
 
 
@@ -9168,10 +9205,7 @@ class PetWindow(QWidget):
             info = dsh_probe()
             if info.get("found"):
                 hwnd = int(info.get("hwnd") or 0)
-                if info.get("iconic"):
-                    ok = dsh_show_window(hwnd)
-                else:
-                    ok = dsh_raise_window(hwnd) or dsh_show_window(hwnd)
+                ok = dsh_wake_window(hwnd)
                 dsh_debug("question: 跳到 DSH hwnd=%#x ok=%s" % (hwnd, ok))
             else:
                 ok = dsh_launch(self.cfg.get("dsh_path") or DSH_EXE)
@@ -9179,6 +9213,64 @@ class PetWindow(QWidget):
         except Exception as exc:
             dsh_debug("question: 跳转失败 %r" % (exc,))
         self.say("去 DSH 那边回答吧～", seconds=2.5, again=True)
+
+    def dsh_restart(self):
+        """卡死时的最后一招：结束 DSH 进程再重新拉起来（会话记录不会丢）。
+
+        只在**主人自己点菜单**时才会走这里 —— 关掉再开是唯一能把"渲染进程卡住 /
+        窗口被外部 show 起来但页面不醒"这两种情况彻底解决的招。
+        先确认一次，别让人误点。
+        """
+        try:
+            if not dsh_is_running():
+                ok = dsh_launch(self.cfg.get("dsh_path") or DSH_EXE)
+                self.say("DeepSeek Harness 起来啦～" if ok else "没找到 DeepSeek Harness…",
+                         seconds=3.0, again=True)
+                return
+            ans = QMessageBox.question(
+                self, "重启 DeepSeek Harness",
+                "会把它关掉再重新打开（聊天记录和会话都在硬盘上，不会丢）。\n"
+                "卡住的时候这一招最管用，确定吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            self.say("好，我把它重启一下～", seconds=4.0, again=True)
+            exe = os.path.basename(DSH_PROC_NAME)
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", exe],
+                               capture_output=True, timeout=8,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as exc:
+                dsh_debug("dsh_restart: taskkill %r" % (exc,))
+            for _ in range(30):                      # 最多等 3 秒，等进程真的退干净
+                if not dsh_is_running():
+                    break
+                time.sleep(0.1)
+            time.sleep(0.6)
+            ok = dsh_launch(self.cfg.get("dsh_path") or DSH_EXE)
+            dsh_debug("dsh_restart: killed+launch ok=%s" % ok)
+            if not ok:
+                self.say("没找到 DeepSeek Harness 的 exe…", seconds=4.0, again=True)
+        except Exception as exc:
+            dsh_debug("dsh_restart: %r" % (exc,))
+
+    def dsh_wake(self):
+        """菜单项：把 DSH 叫到前面并且唤醒（能点）。"""
+        try:
+            info = dsh_probe()
+            if not info.get("found"):
+                ok = dsh_launch(self.cfg.get("dsh_path") or DSH_EXE)
+                self.say("DeepSeek Harness 起来啦～" if ok else "没找到 DeepSeek Harness…",
+                         seconds=3.0, again=True)
+                return
+            hwnd = int(info.get("hwnd") or 0)
+            if dsh_wake_window(hwnd):
+                self.say("DeepSeek Harness 叫到前面了，去点它吧～", seconds=3.0, again=True)
+            else:
+                self.say("把它拉出来了，可是没抢到前台…再点一次试试", seconds=4.0, again=True)
+        except Exception as exc:
+            dsh_debug("dsh_wake(menu): %r" % (exc,))
 
     def _dsh_bar_follow(self, snap=False):
         """把状态条贴到桌宠脚下（居中）；脚下出了屏幕就顶到桌宠头上。"""
@@ -9232,6 +9324,8 @@ class PetWindow(QWidget):
         m.addAction("查看余额", lambda: self.refresh_balance(silent=False))
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
+        m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
         m.addSeparator()
         m.addAction("打开设置…", defer_dialog(self.open_console))
         m.addSeparator()
