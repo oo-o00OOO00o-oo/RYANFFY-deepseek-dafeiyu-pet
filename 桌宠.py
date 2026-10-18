@@ -1597,14 +1597,26 @@ VIEW_LABELS = {"front": "正面（朝屏幕下）", "side": "侧面（左右走�
                "back": "背面（朝屏幕上）", "widget": "小鲸鱼挂件"}
 # 短名字：菜单 / 对话框 / 冒泡里用得着（VIEW_LABELS 太长）
 VIEW_SHORT = {"front": "正面", "side": "侧面", "back": "背面", "widget": "挂件"}
+# ---------- 侧面走路：走路视频抽帧生成的一整套 12 帧 ----------
+# sprites/walk_side/walk-01.png … walk-12.png：
+#   24fps 源按时间戳重采样到 12fps → 自动测出一个循环 → 循环内取 12 帧，
+#   全集共用一个裁剪框（220x306），所以播起来不会横向抖。
+# SIDE_WALK_ANIM_SEC = 一个循环播多少秒（0.9 秒 ≈ 两步，正常人走路节奏）。
+# **它和移动速度是解耦的**：走多快由走路速度决定，动画节奏固定 ——
+# 原来侧面走一步按 WALK_FREQ 的 0.22 秒切帧（那是给颠簸用的相位），步子偏快，
+# 换成真素材后腿会明显打滑，所以侧面单独用这条时间轴。
+SIDE_WALK_FRAMES = ("walk-01", "walk-02", "walk-03", "walk-04", "walk-05", "walk-06",
+                    "walk-07", "walk-08", "walk-09", "walk-10", "walk-11", "walk-12")
+SIDE_WALK_ANIM_SEC = 0.9
 # 动画帧素材（缺哪张就自动退回对应的静态图，不报错）：
 #   正面-眨 —— 待机/正面行走时的眨眼帧；
-#   侧面-2 / 侧面-3 —— 侧面行走的另外两帧（小迈步 / 大迈步），配合静态「侧面」成循环
+#   walk-01…walk-12 —— 侧面行走（新序列，见上）；
 #   背面-2 / 背面-3 / 背面-4 —— 背面行走的四帧循环
-ANIM_FRAMES = ("正面-眨", "侧面-2", "侧面-3", "背面-2", "背面-3", "背面-4")
-# 行走循环的帧序。**侧面是"小迈步 → 并脚 → 大迈步 → 并脚"**：
-# 静态「侧面」是并脚站姿（主人 2026-10-17 18:05 单独给的单帧），
-# 它同时充当循环里的过渡姿势，所以这里会出现两次。
+# 旧的 侧面-2 / 侧面-3 图**留在 walk_side/ 里没删**：新序列缺帧时退回那 3 帧的老逻辑。
+ANIM_FRAMES = ("正面-眨",) + SIDE_WALK_FRAMES + ("背面-2", "背面-3", "背面-4")
+# 行走循环的帧序。侧面这条现在是**回退用**（新序列 12 帧缺失时才走）：
+# "小迈步 → 并脚 → 大迈步 → 并脚"，静态「侧面」是并脚站姿，兼作循环里的过渡姿势，
+# 所以会出现两次。背面仍是 4 帧。
 WALK_FRAMES = {
     "侧面": ("侧面-2", "侧面", "侧面-3", "侧面"),
     "背面": ("背面", "背面-2", "背面-3", "背面-4"),
@@ -6625,7 +6637,7 @@ class PetWindow(QWidget):
             for view, key in VIEW_SHORT.items():
                 if view == "widget":
                     continue
-                if any(k[0].startswith(key + "-") for k in self.sprites if k[1] == h):
+                if self._has_anim_frames(key, h):
                     pix = self._load_named_pixmap(key, h, crop=False)
                     if pix is not None and not pix.isNull():
                         self.sprites[(key, h)] = pix
@@ -6666,7 +6678,7 @@ class PetWindow(QWidget):
         for view, key in VIEW_SHORT.items():
             if view == "widget":
                 continue
-            if any(k[0].startswith(key + "-") for k in self.sprites if k[1] == h):
+            if self._has_anim_frames(key, h):
                 pix = self._load_named_pixmap(key, h, crop=False)
                 if pix is not None and not pix.isNull():
                     self.sprites[(key, h)] = pix
@@ -7548,10 +7560,13 @@ class PetWindow(QWidget):
         - 状态表情：DSH 等你点头/回答 → 着急；出错过 → 圈圈眼（一次性）；
           被你拖着 → 拖拽姿势（见 `PET_EXPR_FRAMES`，缺图自动跳过）
         - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
-        - 侧面 / 背面：行走时按 `WALK_FRAMES[name]` 那一串循环
-          （侧面 3 帧、背面 4 帧，主人 2026-10-17 给的素材）。
-          步频仍是 WALK_LEG_S 一步（0.22 秒），一整个循环 = 两步 = 0.44 秒，
-          帧序均匀铺在这段时间里；缺哪一帧就退回静态图，不会报错。
+        - 侧面：走起来按 `SIDE_WALK_FRAMES` 那 12 帧循环，**节奏固定在
+          SIDE_WALK_ANIM_SEC（0.9 秒一个循环 ≈ 两步）**，和移动速度解耦
+          （`WALK_FREQ` 那条相位是给颠簸用的，步频和动画节奏不是一回事）。
+          站着不动 / 被拖着仍然是静态「侧面」，不会原地踏步。
+          12 帧缺任何一帧 → 退回旧的 3 帧逻辑（`WALK_FRAMES`），再缺就是静态图。
+        - 背面：行走时按 `WALK_FRAMES[name]` 的 4 帧循环（0.44 秒一圈，没动）。
+          缺哪一帧就退回静态图，不会报错。
         """
         act = self._action_frame_name(self._secs())
         if act:
@@ -7569,6 +7584,10 @@ class PetWindow(QWidget):
             return name
         if self.target is None or self.dragging:      # 没走就站着
             return name
+        if name == "侧面" and self._side_walk_ready():
+            # 新序列：一个循环摊在 SIDE_WALK_ANIM_SEC 里，整段取整后取模，永远整循环
+            idx = int((now / SIDE_WALK_ANIM_SEC) * len(SIDE_WALK_FRAMES)) % len(SIDE_WALK_FRAMES)
+            return SIDE_WALK_FRAMES[idx]
         # 一整个行走循环 0.44 秒（两步）；换算成 0..len 的连续位置再取整
         phase = (now * WALK_FREQ / (2 * math.pi)) * 2.0 % 1.0
         idx = int(phase * len(frames)) % len(frames)
@@ -7576,6 +7595,22 @@ class PetWindow(QWidget):
         if (key, self.cur_h) in self.sprites:
             return key
         return name
+
+    def _side_walk_ready(self):
+        """侧面走路的新 12 帧是否全部就位（缺任何一帧就整段退回旧的 3 帧逻辑）。"""
+        h = self.cur_h
+        return all((f, h) in self.sprites for f in SIDE_WALK_FRAMES)
+
+    def _has_anim_frames(self, view, h):
+        """这个方向的动画帧有没有加载（决定静态图要不要按"不裁边"再取一遍）。
+
+        侧面走路帧叫 walk-01…，不带「侧面-」前缀，所以不能再用名字前缀判断，
+        改成对 `WALK_FRAMES` + `SIDE_WALK_FRAMES` 做集合比对。
+        """
+        names = set(WALK_FRAMES.get(view, ()))
+        if view == "侧面":
+            names |= set(SIDE_WALK_FRAMES)
+        return any(k[0] in names for k in self.sprites if k[1] == h)
 
     def _action_frame_name(self, now):
         """一次性动作此刻该画哪一帧；没在播 / 缺图就返回 None。"""
@@ -7962,6 +7997,18 @@ class PetWindow(QWidget):
         except Exception:
             pass
 
+    def _side_walking(self):
+        """是不是真的在左右走（站着不动 / 被拖着 / 上下走都不算）。
+
+        **金币显隐的判据就在这里**：`_rice_tick` 用它决定要不要把金币收起来。
+        - `self.dir in ("left", "right")`：只有左右走才收，正面/背影走照常显示
+        - `self.target is not None`：站着不动（没走路目标）不算
+        - `not self.dragging`：被拎在手里时她手里拿着金币是正常的
+        """
+        return (self.dir in ("left", "right")
+                and self.target is not None
+                and not self.dragging)
+
     def _rice_tick(self):
         """每帧一次：碗被拖着就追，否则抱着一起走。
 
@@ -7978,6 +8025,16 @@ class PetWindow(QWidget):
             if bowl.isVisible():
                 bowl.hide()
                 dsh_debug("rice: 动作播放中，金币已隐藏")
+            return
+        # 侧向走路（左右走）时同样把金币收起来：走路帧里没有它，贴在身前会挡腿。
+        # 判据见 `_side_walking`；**上下走（正面/背影）不隐藏**。
+        # 和跳舞那道闸一样"先藏再 return"，离开侧走状态后由下面的自愈路径显示回来。
+        # 额外一条 `not bowl.dragging`：你正拖着碗时她会追过去，那道追逐逻辑在后面，
+        # 早退会把"追碗"整段跳过（碗还会一直藏着），所以拖碗期间一定要放行。
+        if self._side_walking() and not bowl.dragging:
+            if bowl.isVisible():
+                bowl.hide()
+                dsh_debug("rice: 左右走路中，金币已隐藏")
             return
         # 单张形象（挂件）不显示饭碗 —— 主人要求"挂件时隐藏图标"。
         # 这里每帧判一次，切形象立刻生效，不用重启。
