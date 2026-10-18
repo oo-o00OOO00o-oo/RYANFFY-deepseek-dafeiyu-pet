@@ -192,8 +192,9 @@ else:
 SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
 # 图片按用途分文件夹（主人 2026-10-17 要求，照插件那套组织）：
 #   base/ 正面侧面背面 · idle/ 待机眨眼 · walk_side/ 侧向行走 · walk_back/ 背影行走 · expr/ 表情
+#   cry/ 金币被抢后哭的 16 帧（见下方「金币被抢」那段，懒加载）
 # 加载按这个顺序找；根目录也查一遍，老布局（图片直接摊在 sprites/ 下）照样能用。
-SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "expr", "dance", "")
+SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "cry", "expr", "dance", "")
 
 
 def sprite_file(name):
@@ -4901,8 +4902,14 @@ class PetWindow(QWidget):
 
         # ===== 白饭碗（后加的功能）=====
         self._rice = None
-        self._rice_chasing = False
-        self._rice_next_line = 0.0
+        # 金币被抢的三段状态：None → "grab"（着急）→ "cry"（哭正片）→ "sobj"（一直哭）。
+        # 时间点全部走内部时钟（_secs），帧号现算，不额外开定时器。
+        self._coin_stage = None
+        self._coin_stage_at = 0.0
+        self._coin_released_at = 0.0   # 松手时刻（0 = 还没松）；稳够 COIN_BACK_SEC 才算真还回来
+        self._coin_line_at = 0.0       # 下一句台词的时刻
+        self._coin_line_step = 0       # 说到第几句了
+        self._cry_broken = False       # cry 帧缺任何一张：整段退回只用「着急」，不许崩
         self._rice_z_above = None     # 饭碗当前摆的是"桌宠上面(True) / 后面(False)"
         if self.cfg.get("rice_bowl", True):
             try:
@@ -7521,10 +7528,10 @@ class PetWindow(QWidget):
         if self.skin == SKIN_WIDGET:
             return ("挂件", self.cur_h,
                     self.facing if self.dir in ("left", "right") else 1)
-        # 追饭碗时换「着急」表情（sprites/着急.png；没这张图就用原来的方向图）
-        if (getattr(self, "_rice_chasing", False)
-                and ("着急", self.cur_h) in self.sprites):
-            return ("着急", self.cur_h,
+        # 金币被抢：着急 / 哭（优先级低于动作和拖拽，高于状态表情、行走帧、待机）
+        coin = self._coin_sprite_name()
+        if coin:
+            return (coin, self.cur_h,
                     self.facing if self.dir in ("left", "right") else 1)
         name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
         name = self._anim_frame_name(name)
@@ -8009,11 +8016,146 @@ class PetWindow(QWidget):
                 and self.target is not None
                 and not self.dragging)
 
+    # ---------- 金币被抢：着急 → 哭（正片）→ 一直哭（尾 5 帧循环） ----------
+    # 三段全按内部时钟（self._secs()）算，**不开 QTimer**：帧号 = 进这一段的时刻 →
+    # 现在过了多久 × 帧率，取整。所以换流畅度（tick_ms 40 → 20）也跟着走，不用改代码。
+    # 状态存在 self._coin_stage 里（None / "grab" / "cry" / "sobj"），原先那个只会
+    # 着急的 self._rice_chasing 已经并进来了。
+    def _coin_sprite_name(self):
+        """被抢状态此刻该画哪张图；没被抢 / 图缺了返回 None（照常画方向图→待机）。"""
+        stage = self._coin_stage
+        if stage is None:
+            return None
+        if self.dragging:
+            # 被你拎在手里时**不哭**：拖拽表情的优先级比被抢状态高
+            return None
+        h = self.cur_h
+        if stage == "cry" and not self._cry_broken:
+            elapsed = self._secs() - self._coin_stage_at
+            idx = int(elapsed * CRY_FPS)
+            idx = max(0, min(len(CRY_FRAMES) - 1, idx))
+            name = CRY_FRAMES[idx]
+            if (name, h) in self.sprites:
+                return name
+            self._cry_broken = True        # 播到一半帧没了（换大小 / 换形象）→ 退回着急
+        elif stage == "sobj" and not self._cry_broken:
+            elapsed = self._secs() - self._coin_stage_at
+            idx = int(elapsed * CRY_LOOP_FPS) % len(CRY_LOOP_FRAMES)
+            name = CRY_LOOP_FRAMES[idx]
+            if (name, h) in self.sprites:
+                return name
+            self._cry_broken = True
+        # A 段「着急」；cry 帧缺失时 B/C 段也退到这张
+        return "着急" if ("着急", h) in self.sprites else None
+
+    def _load_cry_frames(self):
+        """把哭的 16 帧塞进 sprites（懒加载）；缺任何一张就整套放弃，返回 False。
+
+        和动作帧一样用 `crop=False`：16 帧共用同一个裁剪框，画布一样大，
+        播放时不会横向抖。files 只读一次盘，装上以后按高度缓存。
+        """
+        h = int(self.cur_h)
+        if all((f, h) in self.sprites for f in CRY_FRAMES):
+            return True
+        loaded = []
+        for key in CRY_FRAMES:
+            pix = self.sprites.get((key, h))
+            if pix is None:
+                pix = self._load_named_pixmap(key, h, crop=False)
+            if pix is None or pix.isNull():
+                return False
+            loaded.append((key, pix))
+        for key, pix in loaded:
+            self.sprites[(key, h)] = pix
+        return True
+
+    def _coin_enter(self, stage, now):
+        """切到某个阶段：记时刻、把上一张记进 prev_key 走淡入淡出、喊第一句。"""
+        self.prev_key = self._sprite_key()     # 换图不硬切（cross_t 那套淡入淡出）
+        self.cross_t = 1.0
+        self._coin_stage = stage
+        self._coin_stage_at = now
+        self._coin_line_step = 0
+        self._coin_released_at = 0.0
+        if stage in ("cry", "sobj"):
+            try:
+                if not self._load_cry_frames():    # 缺一张 → 整段退回只用「着急」
+                    self._cry_broken = True
+            except Exception:
+                self._cry_broken = True
+        lines = COIN_STOLEN_LINES.get(stage) or []
+        if lines:
+            if stage == "sobj":
+                text = lines[0]                    # C 段按顺序递进，第 3 句起头
+            else:
+                text = random.choice(lines)        # A / B 段随机挑一句
+            self.say(text, seconds=2.6, again=True)
+        # C 段才是"越拖越凶"：第 4、5 句隔 COIN_SOBJ_LINE_GAP 秒依次冒
+        self._coin_line_at = (now + COIN_SOBJ_LINE_GAP
+                              if stage == "sobj" and len(lines) > 1 else 0.0)
+
+    def _coin_advance(self, now):
+        """阶段推进：A 着急 1.2 秒 → B 哭正片 0.667 秒 → C 一直哭（尾 5 帧 12fps 循环）。"""
+        if self._coin_stage == "grab":
+            if now - self._coin_stage_at >= COIN_GRAB_SEC:
+                self._coin_enter("cry", now)
+        elif self._coin_stage == "cry":
+            if now - self._coin_stage_at >= CRY_ANIM_SEC:
+                self._coin_enter("sobj", now)
+        if self._coin_stage in ("cry", "sobj") and not self._cry_broken:
+            # 换大小会把哭帧按新高度清掉：这里现补一次（补不上就退回「着急」，不崩）
+            if not all((f, self.cur_h) in self.sprites for f in CRY_FRAMES):
+                try:
+                    if not self._load_cry_frames():
+                        self._cry_broken = True
+                except Exception:
+                    self._cry_broken = True
+
+    def _coin_line_tick(self, now):
+        """C 段台词：第 4、5 句按时间递进；全部说完就每 6 秒把最后一句再念一遍。"""
+        if self._coin_stage != "sobj" or self._coin_line_at <= 0.0:
+            return
+        if now < self._coin_line_at:
+            return
+        lines = COIN_STOLEN_LINES.get("sobj") or []
+        if not lines:
+            self._coin_line_at = 0.0
+            return
+        step = self._coin_line_step + 1
+        if step < len(lines):
+            self._coin_line_step = step
+            self.say(lines[step], seconds=2.6, again=True)
+            self._coin_line_at = now + COIN_SOBJ_LINE_GAP
+        else:
+            self.say(lines[-1], seconds=2.6, again=True)
+            self._coin_line_at = now + 6.0
+
+    def _coin_release(self, say_line=True):
+        """金币还回来了：直接清状态回待机（不播"收住 / 笑"的帧），最多留一句短台词。
+
+        台词只在"真的哭过"（B / C 段）之后才说 —— 手快抢一下又还回来，她不该记仇。
+        `say_line=False` 用于"跳舞 / 换形象把金币收起来"这种和"还回来"无关的清场。
+        """
+        had_cried = self._coin_stage in ("cry", "sobj")
+        self.prev_key = self._sprite_key()     # 当前这张（哭 / 着急）淡回待机
+        self.cross_t = 1.0
+        self._coin_stage = None
+        self._coin_stage_at = 0.0
+        self._coin_released_at = 0.0
+        self._coin_line_at = 0.0
+        self._coin_line_step = 0
+        self._cry_broken = False               # 下一次被抢重新试一遍 cry 素材
+        self.cur_speed = 0.0
+        if had_cried and say_line:
+            lines = COIN_STOLEN_LINES.get("back") or []
+            if lines:
+                self.say(random.choice(lines), seconds=2.2, again=True)
+
     def _rice_tick(self):
-        """每帧一次：碗被拖着就追，否则抱着一起走。
+        """每帧一次：碗被拖着就追（顺带推进"被抢"三段状态），否则抱着一起走。
 
         追的时候不走 self.target，而是直接朝碗挪 —— 这样不会和 wander / follow
-        那套选点逻辑打架（follow 那边也加了一道 `not self._rice_chasing`）。
+        那套选点逻辑打架（follow 那边也加了一道 `self._coin_stage is None`）。
         """
         bowl = getattr(self, "_rice", None)
         if bowl is None:
@@ -8022,6 +8164,9 @@ class PetWindow(QWidget):
         # 这里**先藏再 return**，别让下面的"饭碗不见了就自愈"每帧又把它放出来；
         # 动作结束、action_until 归零后，下一帧照常走自愈把它显示回来。
         if self.action_until > 0:
+            if self._coin_stage is not None:
+                # 跳舞是用户主动点的动作，优先级最高：把"被抢"清掉，跳完别接着哭
+                self._coin_release(say_line=False)
             if bowl.isVisible():
                 bowl.hide()
                 dsh_debug("rice: 动作播放中，金币已隐藏")
@@ -8039,6 +8184,8 @@ class PetWindow(QWidget):
         # 单张形象（挂件）不显示饭碗 —— 主人要求"挂件时隐藏图标"。
         # 这里每帧判一次，切形象立刻生效，不用重启。
         if not self._rice_three_view():
+            if self._coin_stage is not None:
+                self._coin_release(say_line=False)     # 饭碗都没了，别留着一张哭脸
             if bowl.isVisible():
                 bowl.hide()
                 dsh_debug("rice: 当前是单张形象，饭碗已隐藏")
@@ -8093,11 +8240,12 @@ class PetWindow(QWidget):
         except Exception:
             pass
         if bowl.dragging:
-            if not self._rice_chasing:
-                self.prev_key = self._sprite_key()   # 换「着急」表情也走淡入淡出
-                self.cross_t = 1.0
-                self._rice_chasing = True
-                self._rice_next_line = 0.0
+            # 被抢：0~1.2 秒着急 → 哭正片 → 一直哭（尾 5 帧循环），全按内部时钟推进
+            now = self._secs()
+            if self._coin_stage is None:
+                self._coin_enter("grab", now)      # 首次抢走：换「着急」也走淡入淡出
+            self._coin_advance(now)
+            self._coin_line_tick(now)
             self.target = None
             self.rest_until = self.t * self.tick_ms + 100000      # 别自己乱走
             bcx = bowl.x() + bowl.width() / 2.0
@@ -8120,16 +8268,15 @@ class PetWindow(QWidget):
                 self.cur_speed = SPEED * 0.8
             else:
                 self.cur_speed = 0.0
-            if time.time() >= self._rice_next_line:
-                self._rice_next_line = time.time() + 6.0
-                self.say(RICE_HINT, seconds=2.6, again=True)
             self.update()
         else:
-            if self._rice_chasing:
-                self.prev_key = self._sprite_key()   # 从「着急」淡回平时那张
-                self.cross_t = 1.0
-                self._rice_chasing = False
-                self.cur_speed = 0.0
+            # 松手不等于"还回来了"：要稳够 COIN_BACK_SEC 才清状态（手抖一下又抓回去不算）
+            if self._coin_stage is not None:
+                now = self._secs()
+                if self._coin_released_at <= 0.0:
+                    self._coin_released_at = now
+                elif now - self._coin_released_at >= COIN_BACK_SEC:
+                    self._coin_release()           # 直接从哭 / 着急淡回待机
             self._rice_carry_update()
 
     def tick(self):
@@ -8292,7 +8439,7 @@ class PetWindow(QWidget):
             return
         now_ms = self.t * self.tick_ms
 
-        if self.mode == "follow" and not getattr(self, "_rice_chasing", False):
+        if self.mode == "follow" and self._coin_stage is None:
             cursor = self.cursor().pos()
             screen = QApplication.screenAt(cursor) or self.screen() or QApplication.primaryScreen()
             geo = screen.availableGeometry()
@@ -12086,7 +12233,29 @@ SINGLE_INSTANCE_KEY = "dafeiyu-pet-whale-single-instance"
 
 # ===== 白饭碗：能拖走的饭碗，桌宠会追、平时抱着 ============================
 RICE_IMG = os.path.join(ASSET_DIR, "rice_bowl.png")
-RICE_HINT = "别抢我的大白饭！"
+
+# ---------- 金币被抢：着急 → 哭 → 一直哭（三段状态机） ----------
+# 素材：sprites/cry/cry-01.png … cry-16.png（哭戏视频最后 16 帧，24fps，306 高）。
+# 帧号**全部用内部时钟现算**（见 PetWindow._coin_sprite_name），不开 QTimer。
+CRY_FRAMES = tuple("cry-%02d" % i for i in range(1, 17))
+CRY_FPS = 24.0                      # B 段：正片按 24fps 播一遍（16 帧 ≈ 0.667 秒）
+CRY_ANIM_SEC = len(CRY_FRAMES) / CRY_FPS
+# C 段：正片播完就循环**最后 5 帧**（cry-12…cry-16），12fps ≈ 0.42 秒一轮抽泣。
+# 为什么要 12fps 而不是 24：这 5 帧只是小幅抖动，24fps 循环几乎看不出在喘气。
+CRY_LOOP_FRAMES = CRY_FRAMES[-5:]
+CRY_LOOP_FPS = 12.0
+COIN_GRAB_SEC = 1.2                 # A 段（着急）时长：被拖走 0~1.2 秒
+COIN_BACK_SEC = 0.25                # 松手后要稳这么久才算"真的还回来了"
+COIN_SOBJ_LINE_GAP = 2.2            # C 段台词递进间隔（第 3、4、5 句）
+# 台词按阶段取（"炸毛"口吻，越拖越凶）：
+#   grab 被拖走那一下 / cry 开始哭 / sobj 一直哭（按时间递进）/ back 还回来
+# 前两段随机挑一句，第三段按顺序一句比一句凶；全部说完就每 6 秒把最后一句再念一遍。
+COIN_STOLEN_LINES = {
+    "grab": ["诶——？！那、那是我的金币！", "喂！手拿开啦！"],
+    "cry": ["还给我！！你听到没有！", "小偷！坏蛋！那是我的！"],
+    "sobj": ["呜哇——你还我！！", "我、我要生气了！真的！", "坏人！我记住你了！"],
+    "back": ["哼！算你识相。", "…下次不许抢。"],
+}
 # 饭碗换图层（桌宠上面 <-> 后面）的稳定期（秒），**默认 0 = 不拖**。
 # 历史：先是 0.35 秒、再压到 0.12 秒，主人都还觉得"转向背面有延迟"（1s → 0.5s）——
 # 这道延迟的每一毫秒都会被看见，因为桌宠已经转过去了、碗还留在原层。
