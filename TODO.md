@@ -18,14 +18,17 @@
   - 帧号按 `_action_started` + 内部时钟现算，**不开 QTimer**；重复触发只重置时间，
     `action_until` 单调往后推；
   - `tick()` 到 `action_until` 后 `_stop_action()`；播放期间 `target=None` 站住；
-  - 动作期间 `_anim_shake()` 返回 0，避免再叠一层待机左右摇。
+  - 动作期间 `_anim_shake()` 返回 0，避免再叠一层待机左右摇；
+  - **动作期间金币（`_rice`）隐藏**：`start_action()` 先 `hide()`，`_rice_tick()` 在
+    `action_until > 0` 时保持隐藏并跳过"饭碗不见了就自愈"；播完 `action_until` 归零，
+    下一帧照常由自愈路径显示回来（不用另写恢复逻辑）。
 - **子菜单：保留，没有退回扁平**。2026-10-18 用真鼠标验收
   `_work/probe_real_mouse_dance.py`（7 项全过）：悬停「动作」子菜单立刻展开、
   移过去点「高兴跳舞」能触发；说明快捷菜单那套子菜单补丁对这条新子菜单有效。
   踩的坑：本机屏幕缩放 **150%**，真鼠标的 `SetCursorPos` 用物理像素，
   Qt 的 `mapToGlobal` 是逻辑像素，必须 **× 1.5**，否则光标实际停在菜单外面，
   看起来就像"子菜单点不动"。
-- **回归**：`_work/test_dance.py` **31 项全过**；`test_anim.py` 49、
+- **回归**：`_work/test_dance.py` **35 项全过**；`test_anim.py` 49、
   `test_expr_question.py` 34、`test_layer_menu.py` 20、`test_rice_shake.py` 12 全过；
   `compile(桌宠.py)` 通过。
 - **风险 / 没做的**：

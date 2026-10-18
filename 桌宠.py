@@ -7462,6 +7462,14 @@ class PetWindow(QWidget):
         self.action_name = name
         self._action_started = now
         self.action_until = now + ACTION_CLIPS[name][1] / ACTION_SAMPLE_FPS
+        # 动作画面里没有金币：跳舞期间先把它收起来，别贴在衣服前面挡动作。
+        # （_rice_tick 里也有同样的一道闸，否则"饭碗不见了就自愈"会每帧又把它放出来。）
+        bowl = getattr(self, "_rice", None)
+        if bowl is not None:
+            try:
+                bowl.hide()
+            except Exception:
+                pass
         self.prev_key = prev
         self.cross_t = 1.0
         # 跳舞期间站住：清掉走路目标 / 待机小动作（摇头、伸懒腰、蹦一下）
@@ -7786,6 +7794,14 @@ class PetWindow(QWidget):
         """
         bowl = getattr(self, "_rice", None)
         if bowl is None:
+            return
+        # 一次性动作（跳舞）期间把金币收起来：动作帧里没有它，留在前面会挡舞。
+        # 这里**先藏再 return**，别让下面的"饭碗不见了就自愈"每帧又把它放出来；
+        # 动作结束、action_until 归零后，下一帧照常走自愈把它显示回来。
+        if self.action_until > 0:
+            if bowl.isVisible():
+                bowl.hide()
+                dsh_debug("rice: 动作播放中，金币已隐藏")
             return
         # 单张形象（挂件）不显示饭碗 —— 主人要求"挂件时隐藏图标"。
         # 这里每帧判一次，切形象立刻生效，不用重启。
