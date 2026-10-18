@@ -9434,17 +9434,27 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：**一条子菜单都没有**，全是点一下就走。
+        """右键菜单（v1.1.0 起瘦身版）：除「动作」外**没有第二条子菜单**。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
-        菜单里没有子菜单，也就没有那套"悬停展开 / 点击摆渡"的老毛病。
+        「动作」是 2026-10-18 加回来的唯一子菜单（真鼠标点过：悬停立刻展开、
+        点「高兴跳舞」能触发）；其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
         m = QMenu()
         m.addAction("查看余额", lambda: self.refresh_balance(silent=False))
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        m.addSeparator()
+        # 「动作」是快捷菜单里唯一的一条子菜单：目前只有「高兴跳舞」，
+        # 以后别的动作也挂在这儿（ACTION_CLIPS 加一行就会自动出现在菜单里）。
+        act_menu = m.addMenu("动作")
+        for action_name in ACTION_CLIPS:
+            act_menu.addAction(
+                action_name,
+                lambda _=False, n=action_name: self.start_action(n))
+        m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
         m.addSeparator()
