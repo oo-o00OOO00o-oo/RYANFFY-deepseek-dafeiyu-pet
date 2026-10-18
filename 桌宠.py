@@ -7997,6 +7997,18 @@ class PetWindow(QWidget):
         except Exception:
             pass
 
+    def _side_walking(self):
+        """是不是真的在左右走（站着不动 / 被拖着 / 上下走都不算）。
+
+        **金币显隐的判据就在这里**：`_rice_tick` 用它决定要不要把金币收起来。
+        - `self.dir in ("left", "right")`：只有左右走才收，正面/背影走照常显示
+        - `self.target is not None`：站着不动（没走路目标）不算
+        - `not self.dragging`：被拎在手里时她手里拿着金币是正常的
+        """
+        return (self.dir in ("left", "right")
+                and self.target is not None
+                and not self.dragging)
+
     def _rice_tick(self):
         """每帧一次：碗被拖着就追，否则抱着一起走。
 
@@ -8013,6 +8025,16 @@ class PetWindow(QWidget):
             if bowl.isVisible():
                 bowl.hide()
                 dsh_debug("rice: 动作播放中，金币已隐藏")
+            return
+        # 侧向走路（左右走）时同样把金币收起来：走路帧里没有它，贴在身前会挡腿。
+        # 判据见 `_side_walking`；**上下走（正面/背影）不隐藏**。
+        # 和跳舞那道闸一样"先藏再 return"，离开侧走状态后由下面的自愈路径显示回来。
+        # 额外一条 `not bowl.dragging`：你正拖着碗时她会追过去，那道追逐逻辑在后面，
+        # 早退会把"追碗"整段跳过（碗还会一直藏着），所以拖碗期间一定要放行。
+        if self._side_walking() and not bowl.dragging:
+            if bowl.isVisible():
+                bowl.hide()
+                dsh_debug("rice: 左右走路中，金币已隐藏")
             return
         # 单张形象（挂件）不显示饭碗 —— 主人要求"挂件时隐藏图标"。
         # 这里每帧判一次，切形象立刻生效，不用重启。
