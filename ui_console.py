@@ -2743,14 +2743,24 @@ class ConsoleWindow(QWidget):
         page.slider(card, "透明度", "过低会难以看清", 20, 100,
                     int(pet.opacity * 100), "%",
                     lambda v: self._run(pet.set_opacity, v / 100.0))
-        # 气泡（语录 / 余额 / 歌词）用哪套配色：默认跟着上面那套界面主题的亮暗走，
-        # 也能自己定死浅色 / 深色（深色底上原来的白气泡太刺眼）
+        # 气泡（台词 / 问答卡片 / 余额 / 歌词）用哪套配色：默认是星空皮肤，
+        # 也能换回跟着上面那套界面主题走的浅色 / 深色（深色底上原来的白气泡太刺眼）
         self.bubble_seg = Segmented(
-            list(self.ctx.get("BUBBLE_STYLES") or [("auto", "跟随界面")]),
-            getattr(pet, "bubble_style", "auto"),
+            list(self.ctx.get("BUBBLE_STYLES") or [("starry", "星空")]),
+            getattr(pet, "bubble_style", "starry"),
             lambda name: self._run(pet.set_bubble_style, name))
-        page.row(card, "气泡风格", "语录、余额、歌词三种气泡一起换",
+        page.row(card, "气泡风格", "台词、卡片、余额、歌词四种一起换",
                  self.bubble_seg)
+        # 气泡字体：楷体是她原来的手写感，雅黑更清楚；四种气泡一起换
+        fonts = self.ctx.get("BUBBLE_FONTS") or {
+            "kai": {"label": "楷体", "families": ("KaiTi",)},
+            "yahei": {"label": "雅黑", "families": ("Microsoft YaHei UI",)}}
+        self.bubble_font_seg = Segmented(
+            [(key, spec["label"]) for key, spec in fonts.items()],
+            getattr(pet, "bubble_font_key", "kai"),
+            lambda key: self._run(pet.set_bubble_font, key))
+        page.row(card, "气泡字体", "楷体 / 雅黑，四种气泡一起换",
+                 self.bubble_font_seg)
         page.row(card, "窗口层级", "相对其他窗口的层级", self._layer_combo())
         page.row(card, "拖拽吸附四边", "拖到屏幕边缘时自动吸附",
                  Switch(pet.snap_on, pet.set_snap))
@@ -2816,7 +2826,10 @@ class ConsoleWindow(QWidget):
             seg.set_value(getattr(self.pet, "skin", None))
         bubble = getattr(self, "bubble_seg", None)
         if bubble is not None:
-            bubble.set_value(getattr(self.pet, "bubble_style", "auto"))
+            bubble.set_value(getattr(self.pet, "bubble_style", "starry"))
+        bubble_font = getattr(self, "bubble_font_seg", None)
+        if bubble_font is not None:
+            bubble_font.set_value(getattr(self.pet, "bubble_font_key", "kai"))
 
     def _open_skin_library(self):
         """我的形象库…：关掉窗口之后马上把这一页的数刷新一遍（不用再切页 / 重启）。"""

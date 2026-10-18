@@ -1,5 +1,66 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-18：气泡换星空气泡皮肤 + 楷体字）
+
+需求原话（2026-10-18）：
+
+> 「气泡换成「星空」皮肤 + 楷体字（台词 / 问答卡片 / 余额 / 歌词 全换）」
+
+- **素材**：`assets/bubble/starry_tile.png`，256×256 RGBA、四边无缝。
+  生成脚本 `_work/gen_starry_tile.py`（不提交；种子 20261018 可复现）：
+  90 颗小星（直径 1~3px、白/淡蓝/淡紫、alpha 110~225）+ 14 颗亮星
+  （2px 实心 + 5px 柔光，由外向内叠 6 层淡蓝，中心约 alpha 180）+ 3 颗四角闪光
+  （十字、逐级变暗）；4× 超采样画、**3×3 拼图整体缩/整体模糊再裁中间**
+  （否则 LANCZOS / 高斯在画布边缘按"复制边缘像素"处理，接缝会跳）；
+  模糊 0.35px。重跑结果与仓库里那份逐字节一致。
+- **旧素材的两个毛病**（这次重做的原因）：柔光半径写到 5.0 = **10px 直径**，
+  铺在气泡上像一块块灰饼；1× 直接画小圆点没有抗锯齿，星星是方块。
+- **代码**（`桌宠.py`，模块级，紧挨 `bubble_path()`）：
+  - `STARRY_TILE_PATH / STARRY_TOP / STARRY_BOTTOM / STARRY_EDGE / STARRY_INNER_SCRIM`
+  - `starry_tile()`：懒加载 QPixmap，读不到返回 None（退化成纯渐变，不报错）
+  - `paint_starry_bubble(painter, path, rect)`：`setClipPath(path)` → 竖向渐变铺
+    `path.boundingRect()` → 按 **256 取整**平铺星点（最近邻，1:1 不缩放）→ 还原 →
+    1px 淡紫描边。平铺起点对齐全局网格，重画 100 帧/秒也不抖。
+  - `PetWindow._paint_bubble_body(p, path, rect, ink, inner=False)`：
+    starry 走 `paint_starry_bubble`（心声再压一层 scrim），其它风格走老代码。
+  - 四种气泡都改成先 `bubble_path()` 再调它：台词 `_paint_note_bubble`、
+    卡片 `_paint_question_card`、余额（paintEvent 的 balance 分支）、
+    歌词 `_paint_lyric_bubble`。余额 / 歌词原来是 `drawRoundedRect` + 直三角尾巴，
+    现在统一成弧形尾巴的 path。
+  - 新配色 `BUBBLE_INK["starry"]`（18 个键）+ `BUBBLE_PEAK_COLORS["starry"]`。
+  - `BUBBLE_STYLES` 前面加 `("starry", "星空")`，默认值 `BUBBLE_STYLE_DEFAULT`；
+    老 config 迁移：`bubble_starry_migrated` 标记只改一次（存的是 light/dark/auto 的用户
+    升级后也能看到星空），之后按用户自己挑的保留。
+  - 字体：`BUBBLE_FONTS`（kai/yahei → label + 候选字族）+ `_make_bubble_font()` /
+    `set_bubble_font()`；`QFont.setFamilies([...])` 让 Qt 自己挑这台机器上有的那个。
+    四种气泡的字体都从 `self.bubble_font` 派生（余额 / 歌词里是 `QFont(self.bubble_font)`）。
+  - 小字：`_bubble_fonts()` 里楷体给 9 磅地板（卡片原本 7.5/7 磅，楷体在深底上太细）；
+    `_bubble_fonts` 的小字档和余额 / 歌词的 f_small 改成 `QFont.Weight.Medium`。
+- **踩的坑 / 试过不用的**：
+  1. 楷体同磅值字面比雅黑小一圈（9pt 行高 12px vs 15px）。试过整体放大 1.15/1.3：
+     迷你档（窗口 168px）台词会多折一行、"哦"孤零零占一行，卡片题面被截；
+     所以字号沿用原值，只把最小那档抬到 9 磅。
+  2. 离屏（`QT_QPA_PLATFORM=offscreen`）在 Windows 上**没有系统字体**，文字全是 □。
+     截图验证要跑真平台（`_work/test_starry.py` 默认真屏，窗口会闪一下）。
+  3. 星点接缝自检必须按**预乘 alpha** 比：半透明像素 RGB 仍是白色，直接比 RGBA 会
+     把"透明处的白色"当成接缝（第一版量出 44.6 的假接缝）。
+  4. 迷你档问答卡片：右上角「点我去回答 →」约 78px，原来写死留 54px → 跟小标题叠字。
+     现在按实际宽度留位，窄到放不下就不画这行提示。
+  5. 本机沙箱只让写仓库根：`assets/bubble/` 用 Python 写会 PermissionError，
+     素材是用 DSH 文件工具落盘的；`_work/` 同理（新测试 / 截图脚本都用文件工具写）。
+- **回归**：`_work/test_starry.py` 33 项全过；原有 动画 49、问答 34、舞蹈 35、
+  行走朝向 17、三视图 25、着急 10、跟随 6、背影 6、真屏图层 20 全过。
+  `test_rice_anchor.py` 跑得动但截不了图（往 `_work/` 写 PNG 被拒），与本次改动无关。
+- **每帧开销**（离屏整窗重画，歌词气泡 140×78）：星空 0.39ms、原来深色 0.20ms，
+  100 帧/秒的换句动画只多 0.19ms。渐变每帧新建 QLinearGradient 也无所谓；
+  平铺最多 2×1 张图（窗口最宽 300 时 2×1），不是瓶颈。
+- **没做的**：
+  - 没给气泡加星点动画（闪烁 / 流星）—— 需求里没要，且每帧重绘开销要再算。
+  - 高 DPI（150% 缩放）下星点图是 1:1 逻辑像素平铺，物理像素会被最近邻放大 1.5×；
+    肉眼看是"略大的像素星"，没做 @2x 素材。
+  - 歌词顶行「♪ 应用 · 歌名」在迷你档还是会被 LYRIC_BTN_PAD（84px）挤成两行，
+    这是老问题，这次没动。
+
 ## v1.1.6 追加（2026-10-18：高兴跳舞动作）
 
 - **素材来源**：`D:\googel\Chibi whale maid dance.mp4`（720×960、24fps、5.06 秒、
