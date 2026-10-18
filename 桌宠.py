@@ -193,7 +193,7 @@ SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
 # 图片按用途分文件夹（主人 2026-10-17 要求，照插件那套组织）：
 #   base/ 正面侧面背面 · idle/ 待机眨眼 · walk_side/ 侧向行走 · walk_back/ 背影行走 · expr/ 表情
 # 加载按这个顺序找；根目录也查一遍，老布局（图片直接摊在 sprites/ 下）照样能用。
-SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "expr", "")
+SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "expr", "dance", "")
 
 
 def sprite_file(name):
@@ -1540,6 +1540,13 @@ WALK_FRAMES = {
     "侧面": ("侧面-2", "侧面", "侧面-3", "侧面"),
     "背面": ("背面", "背面-2", "背面-3", "背面-4"),
 }
+
+# ---------- 一次性动作（右键「动作 → 高兴跳舞」） ----------
+# 动作名 → (帧名前缀, 帧数)；帧文件在 sprites/dance/<前缀>-NN.png（两位编号）。
+# 以后加动作只要往这张表加一行、把图放进同一个目录：**不点菜单就不读盘**（懒加载），
+# 所以动作再多也不会拖慢启动。
+ACTION_CLIPS = {"高兴跳舞": ("dance", 61)}
+ACTION_SAMPLE_FPS = 12.0      # 素材采样率：视频 24fps，每 2 帧取 1 帧 = 5.08 秒
 
 # ---------- 状态表情（照 DSH 插件那套改的，模型见 TODO/CHANGELOG） ----------
 # 桌宠当前"心情"，由 DSH 真实状态驱动：
@@ -4787,6 +4794,11 @@ class PetWindow(QWidget):
         self.cross_t = 0.0
         self.action = None
         self.action_t = 0.0
+        # 一次性动作（右键「动作」菜单）：播到 action_until 为止，帧按钟取；
+        # 素材只在第一次触发时加载（见 _load_action_frames），启动不读这个目录。
+        self.action_name = ""
+        self.action_until = 0.0
+        self._action_started = 0.0
         self.bubble_text = ""
         self.bubble_until = 0
         self.bubble_inner = False
@@ -7313,6 +7325,11 @@ class PetWindow(QWidget):
         p.setOpacity(1.0)
 
     def _sprite_key(self):
+        # 一次性动作优先：连「挂件」形象也临时换成动作帧（动作 = 用户主动点的，
+        # 优先级在拖拽 / 状态 / 行走之上；见 _anim_frame_name）。
+        act = self._action_frame_name(self._secs())
+        if act:
+            return (act, self.cur_h, 1)
         if self.skin == SKIN_WIDGET:
             return ("挂件", self.cur_h,
                     self.facing if self.dir in ("left", "right") else 1)
@@ -7347,9 +7364,11 @@ class PetWindow(QWidget):
         return have(self._pet_state)
 
     def _anim_frame_name(self, name):
-        """帧动画：待机眨眼、行走换帧、状态表情。帧图没加载就退回静态图（不报错）。
+        """帧动画：待机眨眼、行走换帧、状态表情、一次性动作。帧图没加载就退回静态图（不报错）。
 
-        优先级：**状态表情 > 行走帧 > 待机眨眼**。
+        优先级：**一次性动作 > 状态表情 / 拖拽 > 行走帧 > 待机眨眼**。
+        - 一次性动作：右键「动作」里点的那段（见 ACTION_CLIPS），播完自动回原样；
+          素材缺一张就整套跳过，不会报错。
         - 状态表情：DSH 等你点头/回答 → 着急；出错过 → 圈圈眼（一次性）；
           被你拖着 → 拖拽姿势（见 `PET_EXPR_FRAMES`，缺图自动跳过）
         - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
@@ -7358,6 +7377,9 @@ class PetWindow(QWidget):
           步频仍是 WALK_LEG_S 一步（0.22 秒），一整个循环 = 两步 = 0.44 秒，
           帧序均匀铺在这段时间里；缺哪一帧就退回静态图，不会报错。
         """
+        act = self._action_frame_name(self._secs())
+        if act:
+            return act
         expr = self._pet_expr_frame()
         if expr:
             return expr
@@ -7378,6 +7400,91 @@ class PetWindow(QWidget):
         if (key, self.cur_h) in self.sprites:
             return key
         return name
+
+    def _action_frame_name(self, now):
+        """一次性动作此刻该画哪一帧；没在播 / 缺图就返回 None。"""
+        if self.action_until <= 0:
+            return None
+        clip = ACTION_CLIPS.get(self.action_name)
+        if not clip:
+            return None
+        prefix, count = clip
+        elapsed = now - self._action_started
+        if elapsed < 0:
+            elapsed = 0.0
+        idx = int(elapsed * ACTION_SAMPLE_FPS)
+        if idx >= count:
+            return None
+        name = "%s-%02d" % (prefix, idx + 1)
+        if (name, self.cur_h) in self.sprites:
+            return name
+        return None
+
+    def _load_action_frames(self, name):
+        """按需加载一套动作帧；缺一张就整套放弃（返回 False，不抛异常）。
+
+        **懒加载**：启动 / 换大小 / 换形象都不碰这个目录，只有真的点了菜单才读。
+        帧图用 `crop=False`（保留整块画布）：所有帧画布一样大，播放时不会横向抖。
+        """
+        clip = ACTION_CLIPS.get(name)
+        if not clip:
+            return False
+        prefix, count = clip
+        h = int(self.cur_h)
+        loaded = []
+        for i in range(1, count + 1):
+            key = "%s-%02d" % (prefix, i)
+            pix = self.sprites.get((key, h))
+            if pix is None:
+                pix = self._load_named_pixmap(key, h, crop=False)
+            if pix is None or pix.isNull():
+                return False
+            loaded.append((key, pix))
+        for key, pix in loaded:
+            self.sprites[(key, h)] = pix
+        return True
+
+    def start_action(self, name):
+        """播一段一次性动作；素材没装全就静默跳过（返回 False，不报错）。
+
+        重复触发只重置开始时间和结束时间（不开第二个定时器）：帧号由
+        `_action_started` 和内部时钟现算，`action_until` 单调往后推。
+        """
+        if name not in ACTION_CLIPS:
+            return False
+        try:
+            if not self._load_action_frames(name):
+                return False
+        except Exception:
+            return False
+        now = self._secs()
+        prev = self._sprite_key()          # 先记住"原来那张"，播完淡回去
+        self.action_name = name
+        self._action_started = now
+        self.action_until = now + ACTION_CLIPS[name][1] / ACTION_SAMPLE_FPS
+        self.prev_key = prev
+        self.cross_t = 1.0
+        # 跳舞期间站住：清掉走路目标 / 待机小动作（摇头、伸懒腰、蹦一下）
+        self.target = None
+        self.cur_speed = 0.0
+        self.action = None
+        self.action_t = 0.0
+        self.jump_t = 0.0
+        self.rest_until = self.t * self.tick_ms + 600
+        self.update()
+        return True
+
+    def _stop_action(self):
+        """一段动作播完：清状态，并从最后一帧淡回原来的姿势。"""
+        if self.action_until <= 0:
+            return
+        prev = self._sprite_key()          # 还在播 → 这一张是最后一帧
+        self.action_name = ""
+        self.action_until = 0.0
+        self._action_started = 0.0
+        self.prev_key = prev
+        self.cross_t = 1.0
+        self.rest_until = self.t * self.tick_ms + 800
 
     def _set_dir(self, d, facing=None):
         if d != self.dir:
@@ -7532,6 +7639,9 @@ class PetWindow(QWidget):
         两处各写一份迟早会漂，改一处必须改两处。
         """
         now = self._secs()
+        if self.action_until > 0:
+            # 动作帧自己带舞蹈位移；再叠待机摇摆就成了"左右抖"，画面会晃
+            return (0.0, 0.0, 0.0, 1.0)
         walking = (self.target is not None and not self.dragging)
         if walking:
             # 摇摆按完整步态周期（两步一摇），颠簸和换腿同频：每步落地一次
@@ -7909,6 +8019,17 @@ class PetWindow(QWidget):
         if now_s >= self._next_blink:
             self._blink_until = now_s + 0.16
             self._next_blink = now_s + random.uniform(2.5, 6.0)
+
+        # 一次性动作：到点收尾；播放期间站住不动（帧由 _anim_frame_name 看钟取）。
+        # 放在 ui_open / dragging 的 return 之前，菜单开着、被拖着也照样播完。
+        if self.action_until > 0:
+            if now_s >= self.action_until:
+                self._stop_action()
+            else:
+                self.target = None
+                self.cur_speed = 0.0
+                self.update()
+                return
 
         if self.ui_open:        # 菜单 / 对话框开着：站住不动，免得跳上去把设置面板遮住
             if self.perf_mode:
