@@ -761,27 +761,61 @@ def dsh_launch(exe_path):
 
 
 def dsh_show_window(hwnd=0):
-    """把**被收进后台（隐藏）/ 最小化**的 DSH 主窗口叫回来，并抬到最前面。
+    """把**被 × 收进后台（隐藏）/ 最小化**的 DSH 主窗口叫回来。
 
-    为什么非要这个：DSH 是 Electron，按 × 不是退出，是把窗口 hide 掉、进程留在后台
-    （实测 dsh-debug.log：15:53 那份进程一直在，窗口 0x10a0c 还在，
-    IsWindowVisible=False、尺寸仍是 1135x1025）。这种状态下桌宠原来的处理是
-    `dsh_launch(path)` 重跑一次 exe，可 Electron 的"单实例"判断认为"我本来就活着"，
-    第二次实例直接退出 —— 表现就是**双击桌宠什么也不发生**（主人 2026-10-16 反馈）。
-    这里直接把那个还活着的窗口显示出来，不走单实例那条路。
+    ⚠ **绝对不要对"隐藏"的窗口直接 ShowWindow**（2026-10-17、10-18 各踩一次）。
+    DSH 是 Electron，按 × 不是退出，是把窗口 hide 掉；别的进程对一个隐藏的
+    Electron 窗口 ShowWindow 之后，OS 层看是"可见且已激活"，但 Chromium 内部
+    仍认为自己是隐藏的 —— 于是**渲染停住、点击全部无效**，标题栏的 × 会卡在
+    悬停色不动，就是主人说的"唤起的界面卡死、什么都点不动"。
 
-    ShowWindow 的返回值说的是"窗口**原来**可不可见"，不能当成功判据，
-    所以最后拿 IsWindowVisible 重新读一次。
-
+    现在的策略：
+      1) 窗口可见 → 只做 restore/抢前台（`dsh_wake_window`，安全）；
+      2) 窗口最小化 → SW_RESTORE（系统动作，Electron 认这个）；
+      3) 窗口隐藏（× 收进托盘）→ **重新跑一次 exe**，让 Electron 自己把窗口 show 出来
+         （单实例机制会通知已有进程 show+focus，走的是它自己的代码路径，不会卡）；
+         重跑后等 1.5 秒还看不见，才**兜底** ShowWindow，并在日志里标明是兜底。
     成功返回 True。
     """
     if not hwnd:
         hwnd = dsh_main_hwnd()
     if not hwnd:
         return False
-    # 显示 + 抢前台 + 唤醒（±1px 抖一下让 Electron 重新布局）都在 dsh_wake_window 里，
-    # 这里不再自己拼 ShowWindow —— 以前那版用 SW_SHOWNOACTIVATE，窗口出来了却点不动。
-    return dsh_wake_window(hwnd)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+
+        if u32.IsWindowVisible(hwnd):
+            return dsh_wake_window(hwnd)          # 可见：restore + 抢前台 + 唤醒
+
+        if u32.IsIconic(hwnd):                    # 最小化：系统动作，Electron 认
+            u32.ShowWindow(hwnd, 9)               # SW_RESTORE
+            if u32.IsWindowVisible(hwnd):
+                dsh_wake_window(hwnd)
+                dsh_debug("show: 最小化 → SW_RESTORE ok")
+                return True
+
+        # 隐藏（× 收进托盘）：让应用自己 show 出来
+        ok = dsh_launch(DSH_EXE)
+        dsh_debug("show: 隐藏 → 重跑 exe（让 Electron 自己 show） ok=%s" % ok)
+        for _ in range(15):                       # 最多等 1.5 秒
+            time.sleep(0.1)
+            if u32.IsWindowVisible(hwnd) and not u32.IsIconic(hwnd):
+                dsh_wake_window(hwnd)
+                return True
+        # 兜底：应用自己不 show（可能没实现 second-instance），只能外部显示。
+        # 这条路有概率把窗口弄成"看得见点不动"，所以日志里标出来。
+        dsh_debug("show: 兜底 ShowWindow（有概率卡死，优先用菜单里的「重启 DSH」）")
+        u32.ShowWindow(hwnd, 5)
+        if u32.IsWindowVisible(hwnd):
+            dsh_wake_window(hwnd)
+            return True
+        return False
+    except Exception as exc:
+        dsh_debug("dsh_show_window: %r" % (exc,))
+        return False
 
 
 def _dsh_tasklist_path():
