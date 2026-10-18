@@ -40,7 +40,7 @@ from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice
                             QObject)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
                            QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen,
-                           QPainterPath)
+                           QPainterPath, QLinearGradient)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
@@ -511,9 +511,21 @@ BUBBLE_ANIM_SEC = 0.15          # 气泡自己变大/变小也用同样长的过
 LYRIC_KARAOKE_ON = False        # 逐字高亮（"唱到哪变蓝到哪"）：主人说不要，先关掉（网易云多数歌也没逐字数据）
 LYRIC_KARAOKE_COLOR = (72, 104, 240)   # 已唱到的那部分的颜色（DeepSeek 蓝）
 
-# 气泡风格（语录 / 余额 / 歌词三种气泡共用一套，在「设置 → 桌宠形象 → 外观」里换）：
-# auto = 跟着设置界面的亮暗走，light / dark = 自己定死。
-BUBBLE_STYLES = [("auto", "跟随界面"), ("light", "浅色"), ("dark", "深色")]
+# 气泡风格（语录 / 问答卡片 / 余额 / 歌词四种气泡共用一套，在「设置 → 桌宠形象 → 外观」里换）：
+# starry = 星空皮肤（默认），auto = 跟着设置界面的亮暗走，light / dark = 自己定死。
+BUBBLE_STYLES = [("starry", "星空"), ("auto", "跟随界面"),
+                 ("light", "浅色"), ("dark", "深色")]
+BUBBLE_STYLE_DEFAULT = "starry"
+# 气泡字体：楷体（默认）/ 雅黑。families 按顺序取这台机器上真有的那个。
+# （楷体同磅值的字面比雅黑小一圈：9 磅楷体行高 12px、雅黑 15px。试过整体放大 1.15，
+#  小窗口里台词会多折一行、"哦"孤零零占一行更难看，所以字号沿用原来那套不改。）
+BUBBLE_FONTS = {
+    "kai": {"label": "楷体",
+            "families": ("KaiTi", "楷体", "STKaiti", "SimKai", "Microsoft YaHei UI")},
+    "yahei": {"label": "雅黑",
+              "families": ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI")},
+}
+BUBBLE_FONT_DEFAULT = "kai"
 # 两套气泡底色 / 字色。亮色那套就是原来写死的值（老 config.json 不变样）。
 BUBBLE_INK = {
     "light": {
@@ -557,10 +569,33 @@ BUBBLE_INK = {
         "chip_fg": QColor(206, 214, 236),
         "card_foot": QColor(150, 186, 255),
     },
+    # 星空皮肤：底不画纯色，由 paint_starry_bubble 铺渐变 + 星点，
+    # 这里只管字色 / 胶囊色 —— 一律按"深色底上的亮字"配。
+    "starry": {
+        "bg": QColor(26, 24, 58, 244),             # 兜底用（星点图丢了的时候）
+        "fg": QColor(232, 236, 255),
+        "inner_bg": QColor(18, 20, 44, 244),       # 心声（（）那种）：再压暗一点
+        "inner_fg": QColor(168, 176, 210),
+        "bal_title": QColor(182, 190, 222),
+        "bal_big": QColor(186, 205, 255),
+        "bal_sub": QColor(168, 176, 204),
+        "ly_head": QColor(182, 190, 222),
+        "ly_main": QColor(238, 241, 255),
+        "ly_next": QColor(168, 176, 204),
+        "edge": QColor(150, 168, 248, 120),
+        "shadow": QColor(4, 6, 20, 110),
+        "card_hdr": QColor(176, 188, 232),
+        "card_q": QColor(238, 241, 255),
+        "chip_bg": QColor(52, 58, 96, 210),
+        "chip_edge": QColor(150, 172, 244, 70),
+        "chip_fg": QColor(220, 228, 255),
+        "card_foot": QColor(158, 190, 255),
+    },
 }
 # 余额气泡里"现在高峰 / 空闲"那行的颜色（深色底上得亮一点才看得清）
 BUBBLE_PEAK_COLORS = {"light": (QColor(198, 90, 20), QColor(46, 125, 50)),
-                      "dark": (QColor(232, 152, 92), QColor(120, 214, 156))}
+                      "dark": (QColor(232, 152, 92), QColor(120, 214, 156)),
+                      "starry": (QColor(246, 190, 130), QColor(132, 226, 172))}
 
 # 右键菜单每条前面的小图标：跟设置窗口**同一套**（assets/icons 里的 Lucide 线稿，
 # 同一个 24 网格、线宽 1.75）。按文字**前缀**匹配、取最长的那个 ——
@@ -4119,6 +4154,58 @@ def bubble_path(rect, radius, tail_cx, tail_h):
     return path.united(tail)
 
 
+# ---------- 星空气泡底 ----------
+# 星点层是一张 256×256 的**无缝平铺**图（assets/bubble/starry_tile.png）：
+# 气泡宽度随文字变，九宫格缩放会把星点拉成一道道线，所以只能"一张张贴"。
+STARRY_TILE_PATH = os.path.join(ASSET_DIR, "bubble", "starry_tile.png")
+STARRY_TOP = QColor(13, 17, 43, 244)        # 渐变底：深靛蓝
+STARRY_BOTTOM = QColor(42, 30, 78, 244)     # → 深紫
+STARRY_EDGE = QColor(150, 168, 248, 122)    # 描边：淡紫（比底色亮一档，收边干净）
+STARRY_INNER_SCRIM = QColor(10, 12, 32, 92)  # 心声气泡压暗一层
+_starry_tile = []        # 缓存：[QPixmap] 或 [None]（图没了 → 只铺渐变，不报错）
+
+
+def starry_tile():
+    """星点平铺图，第一次用时才读；找不到图就返回 None（退化成纯渐变底）。"""
+    if not _starry_tile:
+        pm = QPixmap(STARRY_TILE_PATH)
+        _starry_tile.append(None if pm.isNull() else pm)
+    return _starry_tile[0]
+
+
+def paint_starry_bubble(painter, path, rect):
+    """按 path 裁出气泡区域，先铺竖向渐变，再平铺星点，最后描一圈淡紫边。
+
+    rect 是气泡**本体**那块（不含尾巴），渐变就铺这个高度，尾巴吃到底色。
+    星点平铺从整张画布的 0 点对齐（按 256 取整），所以气泡一宽一窄、
+    或者每秒重画一百次，星星都在原地，不会跟着抖。
+    """
+    area = path.boundingRect()
+    painter.save()
+    painter.setClipPath(path)
+    grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom())
+    grad.setColorAt(0.0, STARRY_TOP)
+    grad.setColorAt(1.0, STARRY_BOTTOM)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(grad)
+    painter.drawRect(area)
+    tile = starry_tile()
+    if tile is not None:
+        tw, th = tile.width(), tile.height()
+        x0 = int(math.floor(area.left() / tw)) * tw
+        y0 = int(math.floor(area.top() / th)) * th
+        x1, y1 = int(math.ceil(area.right())), int(math.ceil(area.bottom()))
+        # 平铺用最近邻：星点本来就是 1~3px 的小圆点，插值反而糊成一团
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        for ty in range(y0, y1, th):
+            for tx in range(x0, x1, tw):
+                painter.drawPixmap(tx, ty, tile)
+    painter.restore()
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(STARRY_EDGE, 1))
+    painter.drawPath(path)
+
+
 def wrap_text(fm, text, max_w):
     """按像素宽度折行：中文逐字折，英文整词折（别把单词劈两半）。"""
     lines, cur = [], ""
@@ -4649,7 +4736,8 @@ class PetWindow(QWidget):
             "volume": 0.9,
             "show_peak": True,
             "peak_style": "默认",
-            "bubble_style": "auto",     # 气泡风格：跟随界面 / 浅色 / 深色
+            "bubble_style": BUBBLE_STYLE_DEFAULT,   # 气泡风格：星空 / 跟随界面 / 浅色 / 深色
+            "bubble_font": BUBBLE_FONT_DEFAULT,     # 气泡字体：楷体 / 雅黑
             "line_freq": LINE_FREQ_DEFAULT,
             "lyric_offset": LYRIC_OFFSET_DEFAULT,
             "layer": "top",
@@ -4822,9 +4910,15 @@ class PetWindow(QWidget):
         self.balance_always = bool(self.cfg.get("balance_always", False))
         self.show_peak = bool(self.cfg.get("show_peak", True))
         self.peak_style = self.cfg.get("peak_style", "默认")
-        self.bubble_style = self.cfg.get("bubble_style", "auto")
+        self.bubble_style = self.cfg.get("bubble_style", BUBBLE_STYLE_DEFAULT)
+        # 老 config 里存的是 light / dark / auto：升级后第一次跑给换成星空皮肤
+        # （只在"还没迁移过"时改这一次，之后用户自己在设置里挑什么都保留）
+        if not self.cfg.get("bubble_starry_migrated"):
+            self.cfg["bubble_starry_migrated"] = True
+            self.bubble_style = BUBBLE_STYLE_DEFAULT
+            self.cfg["bubble_style"] = self.bubble_style
         if self.bubble_style not in dict(BUBBLE_STYLES):
-            self.bubble_style = "auto"
+            self.bubble_style = BUBBLE_STYLE_DEFAULT
         self.line_freq = (self.cfg.get("line_freq")
                           if self.cfg.get("line_freq") in LINE_FREQ_LEVELS else LINE_FREQ_DEFAULT)
         try:
@@ -5066,7 +5160,11 @@ class PetWindow(QWidget):
         self.bal_timer.start(BALANCE_TTL * 1000)
         QTimer.singleShot(1200, lambda: self.refresh_balance(silent=False))
 
-        self.bubble_font = QFont("Microsoft YaHei UI", 11)
+        # 气泡字体：楷体（默认）/ 雅黑。字体族按候选顺序试，缺哪个 Qt 自己退下一个。
+        self.bubble_font_key = self.cfg.get("bubble_font", BUBBLE_FONT_DEFAULT)
+        if self.bubble_font_key not in BUBBLE_FONTS:
+            self.bubble_font_key = BUBBLE_FONT_DEFAULT
+        self.bubble_font = self._make_bubble_font()
 
         # 设置窗口：懒加载，点「打开设置…」才建，别拖慢启动
         self._console = None
@@ -6767,6 +6865,7 @@ class PetWindow(QWidget):
             ink = self._bubble_ink()
             f_small = QFont(self.bubble_font)
             f_small.setPointSize(9)
+            f_small.setWeight(QFont.Weight.Medium)     # 楷体细，小字给重一点才看得清
             f_big = QFont(self.bubble_font)
             f_big.setPointSize(15)
             f_big.setBold(True)
@@ -6794,12 +6893,15 @@ class PetWindow(QWidget):
                 bh += fm_s.height()
             bx = (self.width() - bw) / 2
             by = self._bubble_top(bh)
+            rect = QRectF(bx, by, bw, bh)
+            path = bubble_path(rect, 14, self.width() / 2.0, 9)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(ink["bg"])
-            p.drawRoundedRect(QRectF(bx, by, bw, bh), 14, 14)
-            tail = QPointF(self.width() / 2, by + bh)
-            p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 7, tail.y() + 9),
-                                     QPointF(tail.x() + 7, tail.y() + 9)]))
+            p.setBrush(ink["shadow"])
+            p.save()
+            p.translate(0, 2)
+            p.drawPath(path)
+            p.restore()
+            self._paint_bubble_body(p, path, rect, ink)
             ty = by + 8
             p.setFont(f_small)
             p.setPen(ink["bal_title"])
@@ -6875,9 +6977,25 @@ class PetWindow(QWidget):
         return max(2.0, BUBBLE_H + MARGIN - 10 - bh)
 
     # ---------- 气泡外观（2026-10-17 重画：圆角 + 投影 + 细描边 + 小尾巴） ----------
+    def _make_bubble_font(self):
+        """按设置里挑的那档做气泡基础字体（11 磅 + 一串候选字族）。
+
+        候选是**字族列表**：这台机器没装楷体就自动落到雅黑，不会变方块。
+        """
+        spec = BUBBLE_FONTS.get(self.bubble_font_key,
+                                BUBBLE_FONTS[BUBBLE_FONT_DEFAULT])
+        f = QFont()
+        f.setFamilies(list(spec["families"]))
+        f.setPointSize(11)
+        return f
+
     def _bubble_fonts(self, base=10):
         """气泡用的三档字（正文 / 小字 / 更小），统一 PreferFullHinting，中文不糊。"""
         def mk(pt, weight=QFont.Weight.Normal, italic=False):
+            if self.bubble_font_key == "kai":
+                # 楷体字面小：问答卡片原本的"小字/标签"两档只有 7.5 / 7 磅，
+                # 换成楷体就细得看不清了，给个 9 磅的地板（正文那档本来就不低于它）
+                pt = max(9.0, pt)
             f = QFont(self.bubble_font)
             f.setPointSizeF(pt)
             f.setWeight(weight)
@@ -6885,7 +7003,7 @@ class PetWindow(QWidget):
             f.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
             return f
         return (mk(base, QFont.Weight.Medium),                    # 正文
-                mk(base - 1.5, QFont.Weight.Normal),              # 小字
+                mk(base - 1.5, QFont.Weight.Medium),              # 小字（楷体偏细，给 Medium 撑一下）
                 mk(base - 2.0, QFont.Weight.DemiBold))            # 标签（标题/按钮）
 
     def _wrap_cjk(self, fm, text, max_w):
@@ -6903,13 +7021,30 @@ class PetWindow(QWidget):
         lines.append(cur)
         return lines
 
+    def _paint_bubble_body(self, p, path, rect, ink, inner=False):
+        """气泡底：星空皮肤走 paint_starry_bubble，其它风格还是原来的纯色 + 细描边。
+
+        投影由调用方先画（贴在底下那一层），这里只负责"底 + 边"。
+        """
+        if self._bubble_theme() == "starry":
+            paint_starry_bubble(p, path, rect)
+            if inner:                   # 心声气泡：星点还在，再压暗一层，跟"说出口的"分开
+                p.setPen(Qt.PenStyle.NoPen)
+                p.fillPath(path, STARRY_INNER_SCRIM)
+            return
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink["inner_bg"] if inner else ink["bg"])
+        p.drawPath(path)
+        p.setPen(QPen(ink["edge"], 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
     def _paint_note_bubble(self, p, ink):
         """普通台词气泡：柔和投影 + 细描边 + 圆角小尾巴，行距比原来松一点。"""
         inner = self.bubble_inner
         f_main, _f_small, _f_tag = self._bubble_fonts(10.5)
         if inner:
             f_main.setItalic(True)
-        bg = ink["inner_bg"] if inner else ink["bg"]
         fg = ink["inner_fg"] if inner else ink["fg"]
         fm = QFontMetrics(f_main)
         max_w = min(248, self.width() - 10)
@@ -6929,11 +7064,7 @@ class PetWindow(QWidget):
         p.translate(0, 2)
         p.drawPath(path)
         p.restore()
-        p.setBrush(bg)
-        p.drawPath(path)
-        p.setPen(QPen(ink["edge"], 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        self._paint_bubble_body(p, path, rect, ink, inner)
         p.setPen(fg)
         p.setFont(f_main)
         for i, l in enumerate(lines):
@@ -6961,7 +7092,14 @@ class PetWindow(QWidget):
         head = header
         if total > 1:
             head += "  %d/%d" % (index, total)
-        head = ellipsize(fm_h, head, inner_w - 54)      # 右边给"点我去回答"留位
+        # 右边要给"点我去回答 →"留位：按它的**实际宽度**算，别写死 54 ——
+        # 窗口窄（迷你档）时这几个字有 78px，写死就会跟左边的小标题叠在一起；
+        # 窄到连"小标题 + 提示"都放不下时干脆不画提示（整块气泡本来就能点）。
+        foot_text = "点我去回答 →"
+        foot_w = fm_h.horizontalAdvance(foot_text)
+        foot_fits = inner_w >= foot_w + 56
+        head = ellipsize(fm_h, head,
+                         (inner_w - foot_w - 6) if foot_fits else inner_w)
         line_h = fm_q.height() + 1
         chip_h = fm_o.height() + 3
         limit = BUBBLE_H - 2.0
@@ -6990,22 +7128,20 @@ class PetWindow(QWidget):
         p.translate(0, 2)
         p.drawPath(path)
         p.restore()
-        p.setBrush(ink["bg"])
-        p.drawPath(path)
-        p.setPen(QPen(ink["edge"], 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        self._paint_bubble_body(p, path, rect, ink)
         x0 = bx + pad_x
         y = by + pad_y
         # 第一行：左边小标题，右边"点我去回答"
         p.setFont(f_hdr)
         p.setPen(ink["card_hdr"])
-        p.drawText(QRectF(x0, y, inner_w - 54, fm_h.height()),
+        p.drawText(QRectF(x0, y, inner_w if not foot_fits else inner_w - foot_w - 6,
+                          fm_h.height()),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, head)
-        p.setPen(ink["card_foot"])
-        p.drawText(QRectF(x0, y, inner_w, fm_h.height()),
-                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                   "点我去回答 →")
+        if foot_fits:
+            p.setPen(ink["card_foot"])
+            p.drawText(QRectF(x0 + inner_w - foot_w, y, foot_w, fm_h.height()),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       foot_text)
         y += fm_h.height() + 4
         p.setFont(f_q)
         p.setPen(ink["card_q"])
@@ -7058,8 +7194,10 @@ class PetWindow(QWidget):
         return None
 
     def _bubble_theme(self):
-        """气泡现在该用亮色还是深色那套（bubble_style="auto" 时跟着设置界面的主题）。"""
+        """气泡现在该用哪套配色（starry / light / dark，bubble_style="auto" 时跟着设置界面的主题）。"""
         style = getattr(self, "bubble_style", "auto")
+        if style == "starry":
+            return "starry"
         if style in ("light", "dark"):
             return style
         try:
@@ -7098,6 +7236,7 @@ class PetWindow(QWidget):
             ink = self._bubble_ink()
         f_small = QFont(self.bubble_font)
         f_small.setPointSize(9)
+        f_small.setWeight(QFont.Weight.Medium)         # 楷体细，小字给重一点才看得清
         f_main = QFont(self.bubble_font)
         f_main.setPointSize(11)
         # 顶行右边那条要留给 ⏮ ⏸▶ ⏭（见 LYRIC_BTN_PAD），**只有第一行窄**：
@@ -7253,12 +7392,15 @@ class PetWindow(QWidget):
         # 不然 100 帧/秒会把合成器压住 —— 拖窗口就掉帧了（主人反馈的卡顿）。
         self._lyric_repaint_rect = QRectF(bx - 6, by - 6, bw + 12, height + 20).toRect()
         self._lyric_bubble_rect = QRectF(bx, by, bw, height)   # 气泡本体（量按钮位置用）
+        rect = QRectF(bx, by, bw, height)
+        path = bubble_path(rect, 14, self.width() / 2.0, 9)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(ink["bg"])
-        p.drawRoundedRect(QRectF(bx, by, bw, height), 14, 14)
-        tail = QPointF(self.width() / 2, by + height)
-        p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 7, tail.y() + 9),
-                                 QPointF(tail.x() + 7, tail.y() + 9)]))
+        p.setBrush(ink["shadow"])
+        p.save()
+        p.translate(0, 2)
+        p.drawPath(path)
+        p.restore()
+        self._paint_bubble_body(p, path, rect, ink)
         # 右上角那三颗按钮：⏮ 上一首 / ⏸▶ 播放暂停 / ⏭ 下一首
         # （这块气泡就是个迷你播放器，放歌时不用切回播放器）
         btn, gap = float(LYRIC_BTN_SIZE), float(LYRIC_BTN_GAP)
@@ -9868,6 +10010,7 @@ class PetWindow(QWidget):
             "DOUBLE_CLICK_CHOICES": DOUBLE_CLICK_CHOICES,
             "PEAK_TEXT_STYLES": PEAK_TEXT_STYLES,
             "BUBBLE_STYLES": BUBBLE_STYLES,
+            "BUBBLE_FONTS": BUBBLE_FONTS,
             "LINE_FREQ_LEVELS": LINE_FREQ_LEVELS,
             "LINE_SECTIONS": LINE_SECTIONS,
             "SKIN_PET": SKIN_PET,
@@ -11266,7 +11409,7 @@ class PetWindow(QWidget):
         self.update()
 
     def set_bubble_style(self, style):
-        """气泡风格：跟随界面 / 浅色 / 深色（语录、余额、歌词三种气泡一起换）。"""
+        """气泡风格：星空 / 跟随界面 / 浅色 / 深色（台词、卡片、余额、歌词一起换）。"""
         if style not in dict(BUBBLE_STYLES):
             return
         self.bubble_style = style
@@ -11278,8 +11421,23 @@ class PetWindow(QWidget):
         self.update()
         self.save_config()
         self.say("气泡换成"
-                 + {"auto": "跟着界面走", "light": "浅色", "dark": "深色"}.get(style, "浅色")
+                 + {"starry": "星空", "auto": "跟着界面走",
+                    "light": "浅色", "dark": "深色"}.get(style, "浅色")
                  + "啦")
+
+    def set_bubble_font(self, key):
+        """气泡字体：楷体 / 雅黑（四种气泡一起换）。"""
+        if key not in BUBBLE_FONTS:
+            return
+        self.bubble_font_key = key
+        self.cfg["bubble_font"] = key
+        self.bubble_font = self._make_bubble_font()
+        # 折行、颜色都烘在歌词排版缓存里；字号没变但字族变了，得重算
+        self._lyric_layout_key = None
+        self._lyric_prev_key = None
+        self.update()
+        self.save_config()
+        self.say(f"气泡字体换成{BUBBLE_FONTS[key]['label']}啦")
 
     def set_line_freq(self, name):
         """语录频率：安静 / 正常 / 话多 / 话痨（管的是"闲着时自己冒话"的频率）。"""
