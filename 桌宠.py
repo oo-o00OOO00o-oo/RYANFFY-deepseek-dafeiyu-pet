@@ -1639,10 +1639,32 @@ ACTION_SAMPLE_FPS = 12.0      # 素材采样率：视频 24fps，每 2 帧取 1 
 # 和走路 / 动作一样**懒加载**：正常模式启动不读这个目录，第一次切到通透才加载。
 CLEAR_IDLE_SUBDIR = "idle_clear"
 CLEAR_IDLE_FPS = 12.0
-CLEAR_IDLE_COUNT = 33
-CLEAR_IDLE_FRAMES = tuple("idle-%02d" % i for i in range(1, CLEAR_IDLE_COUNT + 1))
+
+
+def scan_clear_idle_frames():
+    """扫 sprites/idle_clear/ 里**实际存在**的 idle-NN.png，按编号排序。
+
+    帧号允许不连续：主人会把不满意的帧删掉（比如 idle-25 已经删了），
+    剩下的直接连起来播就行，不用再去改代码里的"总帧数"。
+    """
+    try:
+        names = os.listdir(os.path.join(SPRITE_DIR, CLEAR_IDLE_SUBDIR))
+    except OSError:
+        return ()
+    nums = []
+    for n in names:
+        if not n.endswith(".png"):
+            continue
+        stem = n[:-4]
+        if len(stem) == 7 and stem.startswith("idle-") and stem[5:].isdigit():
+            nums.append(int(stem[5:]))
+    return tuple("idle-%02d" % i for i in sorted(set(nums)))
+
+
+CLEAR_IDLE_FRAMES = scan_clear_idle_frames()
+CLEAR_IDLE_COUNT = len(CLEAR_IDLE_FRAMES)
 CLEAR_IDLE_FRAME_SET = frozenset(CLEAR_IDLE_FRAMES)
-CLEAR_IDLE_ANIM_SEC = CLEAR_IDLE_COUNT / CLEAR_IDLE_FPS    # 整段播一遍 = 2.75 秒
+CLEAR_IDLE_ANIM_SEC = (CLEAR_IDLE_COUNT / CLEAR_IDLE_FPS) if CLEAR_IDLE_COUNT else 0.0
 
 # 通透模式的循环 BGM：音频/歌词由使用者自备，仓库不包含版权素材。
 # 默认路径按本机 Music 目录写；config.json 里可以用 clear_music_path /
