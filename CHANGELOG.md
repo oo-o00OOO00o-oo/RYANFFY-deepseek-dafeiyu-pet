@@ -2,6 +2,42 @@
 
 ## v1.1.6（未发布）
 
+### 高兴跳舞 / 抢 token 哭有声音了
+
+- 点右键「动作 → 高兴跳舞」：会同时播一段 5.06 秒的舞蹈音乐，和 61 帧动作对齐；
+  跳完自动停。
+- 金币被抢、进入「哭」那一段时：会播哭声，**从 3350ms 开始**（跳过前面 3.3 秒安静段，
+  对齐最后 16 帧哭戏）；金币还回来或跳舞打断时立刻停。
+- 音量跟设置里的音量走（动作音轨按 0.8 的相对音量）；「音效」关掉时不播。
+- 两段音频和通透模式的 BGM 是**两套独立播放器**，不会互相抢；同一时间只播一条动作音轨。
+- 音频文件已放进仓库：`assets/sfx/dance.m4a`（82 KB）、`assets/sfx/cry.m4a`（66 KB）。
+
+- 实测：`dance.m4a` 5056ms、`cry.m4a` 4063ms；Qt FFmpeg 后端直接播，没有转码。
+- 实测：新增 `_work/test_action_sfx.py` **29 项全过** —— 文件存在 / 体积 / 时长；
+  跳舞从 0 起播、音量 0.4（设置 0.5 × 0.8）、进度在走、重触发换新音轨、跳完收掉；
+  哭段从 3350ms 起播（实测 3529ms）；金币还回来收掉哭声；金币释放不会误停跳舞音轨；
+  动作音轨不会被当成外部歌曲；和通透 BGM 是两个播放器；缺文件 / 关音效静默不崩。
+- 回归：normal / clear 两套全绿（`test_action_sfx` 29、`test_idle_mode` 90、
+  `test_anim` 73、`test_side_walk` 50、`test_coin_cry` 67、`test_dance` 35、
+  `test_rice_shake` 12、`test_layer_menu` 20、`test_expr_question` 34、
+  `test_new_views` 25、`test_anxious_sprite` 10、`test_walk_dir` 17、
+  `test_back_walk4` 6、`test_follow_face` 6、`test_starry` 33）；编译通过。
+
+### 维护者相关（发版 / 仓库，不写进 Release 说明）
+
+- 音源：`D:\googel\Chibi whale maid dance.m4a` →
+  `assets/sfx/dance.m4a`；`D:\googel\Chibi Anime Whale Maid Girl Walking Animation (1).m4a`
+  → `assets/sfx/cry.m4a`。没有转码、没改扩展名。
+- 常量在 `桌宠.py`：`SFX_DANCE_PATH / SFX_CRY_PATH / SFX_CRY_START_MS / ACTION_SFX`。
+- 播放器：`_play_sfx_media()` / `_stop_sfx_media()`，独立字段 `_sfx_player / _sfx_audio /
+  _sfx_volume / _sfx_path`，不和 `_clear_music` 共用。
+- 触发点：`start_action()` 播 dance；`_stop_action()` 停；`_coin_enter("cry")` 播 cry；
+  `_coin_release()` 只停 cry（用 `_sfx_path` 判断，避免误停跳舞）；`quit_app()` 收尾。
+- `cry.m4a` 的 `setPosition(3350)` 在媒体未 Loaded 时会被吞掉，所以 `_play_sfx_media()`
+  在第一次 `Loaded/Buffered/Buffering` 状态再 seek 一次。
+- 动作音轨播放期间 `_apply_now_playing()` 不接外部媒体会话，免得 Windows 把它当成
+  “切到某首歌”冒泡。
+
 ### 通透模式待机：站着时会自己东张西望
 
 - 右键 →「待机模式」→「通透模式」：她站着不动时换成一段视频待机循环 ——

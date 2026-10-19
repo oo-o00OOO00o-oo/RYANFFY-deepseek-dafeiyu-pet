@@ -1,5 +1,43 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-19：高兴跳舞 / 抢 token 哭的动作音频）
+
+需求：给「高兴跳舞」和「抢 token 哭」配一次性音频，音频文件直接进仓库。
+
+- **音源**（主人提供，未转码、未改扩展名）：
+  - `D:\googel\Chibi whale maid dance.m4a` → `assets/sfx/dance.m4a`
+    （84,011 字节，5056ms，AAC 44.1kHz）
+  - `D:\googel\Chibi Anime Whale Maid Girl Walking Animation (1).m4a` →
+    `assets/sfx/cry.m4a`（67,831 字节，4063ms；前 3.3 秒安静，哭声从 3350ms 起）
+- **路径**：`SFX_DANCE_PATH / SFX_CRY_PATH = os.path.join(ASSET_DIR, "sfx", ...)`，
+  跟 `assets/` 一起打包（`桌宠.spec` 整目录收 assets）。
+- **播放器**：`PetWindow._play_sfx_media(path, start_ms=0, volume=0.8)` /
+  `_stop_sfx_media()`；独立字段 `_sfx_player / _sfx_audio / _sfx_volume / _sfx_path`，
+  不和通透模式的 `_clear_music` / `_clear_audio` 共用。
+  - 音量 = 设置音量 × `volume`（默认 0.8）；`set_volume()` 会同步当前音轨。
+  - `sound_on=False` 时不播；文件不存在 / 解码失败静默返回 False。
+  - `start_ms` 在媒体未 Loaded 时会被吞掉，所以第一次 `Loaded/Buffered/Buffering`
+    状态再 `setPosition` 一次。
+  - 连 `mediaStatusChanged`，自然 EndOfMedia 时自动收掉播放器。
+- **触发点**：
+  - `start_action("高兴跳舞")` → `ACTION_SFX` 查表 → 播 dance，从 0。
+  - `_stop_action()` → 停；重复触发先停旧再开新。
+  - `_coin_enter("cry")`（B 段）→ 播 cry，从 3350ms；`_cry_broken` 时不播。
+  - `_coin_release()` → 只停 cry（`_sfx_path == SFX_CRY_PATH`），避免误停跳舞音轨。
+  - `quit_app()` → 收尾。
+- **媒体会话**：动作音轨播放期间 `_apply_now_playing()` 直接忽略外部信息，
+  免得 Windows 把它当成“切到某首歌”冒泡 / 顶掉气泡。
+- **测试**：`_work/test_action_sfx.py` 29 项；normal / clear 两套全绿。
+- **已知取舍 / 风险**：
+  - 动作音频和通透 BGM 同时存在时会有两条 QMediaPlayer；目前各自独立音量，
+    没有做“BGM 自动 ducking（压低）”这种混音处理。
+  - 音效关掉会连动作音频一起静音（沿用 `sound_on`）。
+  - 音频是主人自制 / 提供的，版权由主人负责；已按主人要求直接提交进仓库。
+  - `cry.m4a` 的 3350ms 是固定值；以后换音频或重新剪哭戏帧，要同步改
+    `SFX_CRY_START_MS`。
+  - 没有做“音量滑杆拖动时实时跟手”的专项测试，只在 `_play_sfx_media` 创建时
+    和 `set_volume()` 里同步。
+
 ## v1.1.6 追加（2026-10-19：通透模式待机）
 
 需求：原待机改名「正常模式」；新增「通透模式」用视频做待机循环；右键菜单两项互斥、
