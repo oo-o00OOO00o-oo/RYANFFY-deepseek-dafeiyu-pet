@@ -2,6 +2,90 @@
 
 ## v1.1.6（未发布）
 
+### 通透模式待机：站着时会自己东张西望
+
+- 右键 →「待机模式」→「通透模式」：她站着不动时换成一段视频待机循环 ——
+  正面 → 转身 → 背影 → 侧面 → 转回正面，转完一圈约 2.75 秒，像在左右张望。
+- **通透模式不改变移动模式**：自由散步 / 跟随鼠标 / 原地待着都照旧。
+- **通透模式下 token / 金币收起来**（最新要求恢复）：站着 / 走路 / 被她拎起来都藏，
+  只有正在拖金币 / 被抢时不藏；切回正常模式自动回来。其他时候的显隐规则不变
+  （左右走 / 跳舞 / 被抢）。
+- **通透模式自动循环播放《朋友的酒》**：进通透模式就放，切回正常模式暂停、再切回来接着放；
+  音量跟设置里的音量走。气泡里同步显示表情版歌词（49 句，带 🎉😆🍺🌹 这些表情）。
+- **音频 / 歌词由使用者自备，仓库不包含版权素材**：路径见 `config.json` 的
+  `clear_music_path` / `clear_lyrics_path`；本机有就播，没有就静默不播（不报错、不卡住）。
+- 通透模式默认的气泡行为和正常模式一致（问答卡片、余额、外部歌词都照常）；
+  想要“只显示 BGM 歌词”，把 `clear_only_bgm_lyrics` 设成 `true`（默认 `false`）。
+- 通透模式放自己的 BGM 时，不会因为 Windows 媒体会话把它当成外部歌曲再冒一句
+  「切到《朋友的酒》啦」；默认只忽略这一首，开了 `clear_only_bgm_lyrics` 才屏蔽全部外部媒体。
+- 切回「正常模式」立刻回到原来那张正面站姿 + 眨眼，原来的待机一个像素都没改。
+- 走起来、被你拎起来、金币被抢、DSH 状态表情、点「高兴跳舞」时，通透待机都会让位，
+  表现和正常模式一致；通透模式里不叠眨眼（素材自己带表情变化）。
+- 第一次切到通透模式才读这 33 张帧，切回正常模式不卸载；正常模式启动不会预载，
+  启动速度和内存不受影响。
+- 素材缺帧 / 目录被改名 / 删掉一帧 → 自动退回正常模式，只在日志里记一句，不弹窗、不崩。
+- 菜单两项互斥、当前模式打勾；点完立即生效并写进 `config.json`，重启后保持上次选的模式。
+
+- 实测：源视频 `C:\Users\16050\Desktop\Chibi Anime Whale Maid Animation.mp4`，
+  720×960、24fps、播放器报 5056ms；QtMultimedia 0.2x 慢放全量解码 **121 帧**
+  （时间戳 0.000~5.000 秒，实测 24.00fps），按时间戳等间隔重采样到 **12fps = 61 帧**。
+- 实测：源片后面还有小半圈「往右转」的余量（54~61 帧），直接整段循环会从侧面
+  突然跳回正面。只留第 **21~53 帧（33 帧 = 2.75 秒）** 这一整圈，重新编号成
+  `idle-01…idle-33`；首尾帧差 **5.70**（相邻帧差中位 21.13），循环接缝比正常换帧还小。
+- 实测：抠绿用「离底色多远 + 绿色主导度」双判据；另加一条地面投影判据
+  （RGB / 底色的比例基本一致、整体明显更暗才剔掉），脚下一圈灰影不再留下。
+  暗绿描边只压绿（G→(R+B)/2），不抠掉。
+- 实测：水印「豆包AI生成」在部分帧的右下角（白色小字），按"小连通块 + 贴右下角 +
+  四周基本透明"整块剔掉，没有矩形涂；右下角 3 倍放大图 `_work/idle_out_trim/check_corner.png`
+  无文字残留，裙角 / 尾巴完好。
+- 实测：33 帧共用裁剪框 (0,26,720,894) → 720×868 → 等比缩到 **254×306**，
+  所有帧尺寸完全一致，总体积 **3.00 MB**（上限 6 MB，没触发降到 10fps）。
+- 实测：新增 `_work/test_idle_mode.py` **90 项全过** —— 33 帧齐全且尺寸一致、
+  首尾帧几乎重合；默认 normal 是正面 / 眨眼、启动不预载 idle-NN；clear 按
+  `CLEAR_IDLE_ANIM_SEC` 整圈 33 帧依次出现；通透模式不出「正面-眨」；
+  token 在通透模式隐藏、移动模式不被通透模式改；BGM 自动播放、进度在走、歌词进气泡；
+  默认气泡与正常模式一致，`clear_only_bgm_lyrics=true` 时只留歌词；
+  本地音频 / 歌词缺失时静默不崩；走路 / 拖拽 / 金币被抢 / 一次动作 / DSH 表情的
+  优先级都正确；目录改名 / 删一帧自动退回 normal；菜单勾选与 `cfg["idle_mode"]`
+  一致、两项互斥；写进 config.json 后重启保持。
+- 实测：真机真鼠标探针 `_work/probe_real_mouse_idle_mode.py` **8 项全过**：
+  右键 → 悬停「待机模式」展开 → 点「通透模式」→ 站着出 `idle-30` → 再右键 →
+  勾选状态正确 → 点「正常模式」→ 立刻回到「正面」。
+  截图 `_work/shot_idle_mode_menu.png`、`_work/shot_idle_mode_clear.png`。
+- 回归：**normal / clear 两套全绿** —— `test_idle_mode` 90 项、`test_anim` 73、
+  `test_side_walk` 50、`test_coin_cry` 67、`test_dance` 35、`test_rice_shake` 12、
+  `test_layer_menu` 20、`test_expr_question` 34、`test_new_views` 25、
+  `test_anxious_sprite` 10、`test_walk_dir` 17、`test_back_walk4` 6、
+  `test_follow_face` 6、`test_starry` 33 全过；`桌宠.py` 编译通过。
+
+### 维护者相关（发版 / 仓库，不写进 Release 说明）
+
+- 抽帧 `_work/extract_idle_clear.py`、处理 `_work/build_idle_clear.py`、
+  回归 `_work/test_idle_mode.py`、真机探针 `_work/probe_real_mouse_idle_mode.py`
+  都在 `_work/`（不提交）。
+- 新素材 `sprites/idle_clear/idle-01.png … idle-33.png`（254×306，只出 306 母版，
+  其它档位加载器现缩）；`"idle_clear"` 已加进 `SPRITE_SUBDIRS`，
+  **不进 `ANIM_FRAMES`**（懒加载，启动不读这个目录）。
+- 通透模式 BGM：**仓库不含音频/歌词**（`assets/clear_idle/*.ogg` 已 gitignore）；
+  `config.json` 的 `clear_music_path` / `clear_lyrics_path` 指向本地文件。
+  `assets/clear_idle/lyrics.example.txt` 只留格式说明 + 空模板；README 写明版权归属使用者。
+  播放器在 `_start_clear_music()` 里 lazy 建，`tick()` → `_tick_clear_music()` 每帧同步、
+  `_tick_clear_lyrics()` 按 `position()` 换句；找不到文件只打印一次，不建播放器。
+- `clear_only_bgm_lyrics`（默认 `false`）：false 时 clear 的气泡行为与 normal 一致；
+  true 才启用 `say(lyric=True)` 白名单 + `_bubble_mode()` / `show_balance_bubble()` /
+  `_announce_question()` 的“只放歌词”闸。
+- 通透模式 token 隐藏分支在 `_rice_tick()`：`idle_mode=="clear"`、帧已加载、
+  没在拖金币、没被抢时 `hide()`；切回 normal 由自愈路径显示。
+- 配置键 `idle_mode`（`normal` / `clear`，默认 `normal`）；
+  常量 `CLEAR_IDLE_SUBDIR / CLEAR_IDLE_FPS / CLEAR_IDLE_COUNT / CLEAR_IDLE_FRAMES /
+  CLEAR_IDLE_ANIM_SEC`。判据在 `PetWindow._clear_idle_frame_name()`（只负责最底层待机）、
+  `_anim_frame_name()`（一次性动作 / 表情之后、行走 / 眨眼之前）、
+  `_clear_idle_loaded()`（懒加载 + 缺帧回退）。
+- 既有测试统一通过 `_work/_testutil.py` 的 `make_pet(pet)` 构造 PetWindow，默认钉
+  `idle_mode=normal`、`mode=wander`；跑 clear 套件用 `PET_TEST_IDLE_MODE=clear`。
+  clear 套件里少量“正常站姿 / 眨眼”断言改成“允许 idle-NN”，测试名带
+  `[clear 下由通透帧接管]` 标注。
+
 ### 金币被抢：先着急，不还就哭，一直不还就一直哭
 
 - 金币被拖走的那一下她**先愣一下、着急 1.2 秒**，然后才开始哭 —— 不再一上来就换一张着急脸。

@@ -1,5 +1,105 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-19：通透模式待机）
+
+需求：原待机改名「正常模式」；新增「通透模式」用视频做待机循环；右键菜单两项互斥、
+当前模式打勾、立即生效并持久化。
+
+- **素材**：`C:\Users\16050\Desktop\Chibi Anime Whale Maid Animation.mp4`
+  —— 720×960、24fps、播放器报 5056ms、绿幕底、右下角（部分帧）有「豆包AI生成」水印。
+  内容是多角度待机：正面 → 转身 → 背影 → 侧面 → 转回正面，人物基本站着不动。
+- **抽帧**（`_work/extract_idle_clear.py`）：PySide6 QtMultimedia 的
+  `QMediaPlayer + QVideoSink`（本机没有 ffmpeg / opencv），**0.2x 慢放**，
+  按 `QVideoFrame.startTime()`（微秒）去重后落盘。实测解出 **121 帧**（0.000~5.000s，
+  24.00fps）；需求里估的 118 帧和实际有出入，以实际为准。
+- **采样**（`_work/build_idle_clear.py`）：按时间戳等间隔重采样到 **12fps = 61 帧**
+  （`n = round(span × 12) + 1`，最近邻原帧）。
+- **剪成一圈（2026-10-19 用户反馈后）**：整段 61 帧里其实转了不止一圈，
+  54~61 帧是"多往右转"的余量，直接循环会从侧面突然跳回正面。只取 12fps 的
+  **第 21~53 帧（33 帧 = 2.75 秒）**，重新编号 `idle-01…idle-33`；首尾帧差 5.70，
+  相邻帧差中位 21.13，接缝比正常换帧还小。处理脚本里 `TRIM_START, TRIM_END = 21, 53`。
+- **抠图链**：绿键双判据（`alpha = min(a_dist, a_dom)`；底色约 (143,195,137)，
+  `dist ≤ 50` 或 `dom ≥ 58` 算背景）→ 地面投影单独按"三通道 / 底色比例基本一致、
+  整体更暗（s 0.35~0.92）"剔掉 → 水印按"小连通块 + 贴右下角 + 四周基本透明"
+  逐个删除（没有整块涂）→ 33 帧共用一个裁剪框 → 预乘 alpha 缩到 306 高。
+  暗绿描边把 G 压到 (R+B)/2，保留描边、不发绿。
+- **最终参数**：裁剪框 (0,26,720,894) → 720×868 → **254×306**；
+  **33 帧**；单帧约 90~115 KB，总体积 **3.00 MB**（上限 6 MB）。
+  没触发"超 6MB 降到 10fps"的兜底。
+  **注意**：处理脚本里保留 10fps 兜底；如果以后真的用 10fps 重出，必须同步改
+  `CLEAR_IDLE_COUNT`（本次 33），否则缺帧检查会一直失败。
+- **移动模式 / token**：移动模式**不改**（自由散步 / 跟随鼠标 / 原地待着）。
+  token 在通透模式下**隐藏**（主人 2026-10-19 最新要求恢复）：站着 / 走路 / 被拎起来都藏，
+  只有正在拖金币 / 被抢时不藏；切回 normal 由自愈路径显示。
+  普通状态下仍只有左右走 / 跳舞 / 被抢时隐藏。
+- **BGM + 歌词（A 方案：音频不进仓库）**：仓库只保留 `assets/clear_idle/README.txt` +
+  `lyrics.example.txt`（格式说明 + 空模板）；`assets/clear_idle/*.ogg` 已 gitignore。
+  - `config.json` 新增 `clear_music_path`，默认
+    `C:\Users\16050\Music\希玡不月半 - 朋友的酒 (DJ-大奶線唱)_L.ogg`。
+    这个默认名和本机实际文件名对不上时，`_resolve_clear_music_path()` 会在同目录找
+    文件名含「朋友的酒」的 `.ogg`（本机实际是 `希玥不月半 - 朋友的酒 (DJ-夢ノ結唱)_L.ogg`）。
+  - `clear_lyrics_path` 默认
+    `C:\Users\16050\Music\希玥不月半 - 朋友的酒 (DJ-夢ノ結唱)_L.lyrics.txt`；
+    文件不存在时再试音频同目录的 `*.lyrics.txt` / `lyrics.txt`。
+  - 进 clear：`_start_clear_music()` 懒建 `QMediaPlayer + QAudioOutput`，
+    `setLoops(Infinite)`，音量跟 `self.volume`；切回 normal 只 `pause()`，再切回来接着放。
+    找不到音频 / 播放器起不来：只打印一次，不建播放器、不卡住、不弹窗。
+  - 歌词：`tick()` → `_tick_clear_music()` → `_tick_clear_lyrics()`，按
+    `player.position()` 找当前句，换句才 `say(..., again=True, lyric=True)`。
+- **气泡行为**：`clear_only_bgm_lyrics` 默认 **false**，通透模式的气泡行为和正常模式一致
+  （问答卡片 / 余额 / 外部歌词都照常）。设成 true 时：
+  `say()` 只放行 `lyric=True`；`_bubble_mode()` 只返回当前歌词文本；
+  `show_balance_bubble()` / `_announce_question()` 在 clear 下直接 return。
+  clear+BGM 期间 `_apply_now_playing()` 默认只忽略标题含「朋友的酒」的自己这路媒体；
+  开了 `clear_only_bgm_lyrics` 才屏蔽全部外部媒体。
+- **配置**：`idle_mode` = `"normal"`（默认）/ `"clear"`；由右键
+  「待机模式 → 正常模式 / 通透模式」写入 `config.json`，打开菜单时现读、两项互斥。
+- **播放判据**：
+  - `_clear_idle_frame_name(now)`：`idle_mode == "clear"`、`target is None`、
+    `not dragging` 才出帧；`idx = int((now / CLEAR_IDLE_ANIM_SEC) * 33) % 33`。
+  - `_anim_frame_name()` 里排在一次性动作 / DSH 表情 / 拖拽之后、行走帧 / 眨眼之前；
+    通透模式下 `正面` 不再走眨眼分支（`clear_on` 为真时跳过 `正面-眨`）。
+  - `_sprite_key()` 对 `idle-NN` 固定 `facing = 1`（视频自带朝向，不再按左右镜像）。
+  - `_clear_idle_loaded()` 懒加载：第一次切 clear 才读 33 张；按当前高度缓存一套，
+    切回 normal 不卸载；失败结果也缓存，手动再切会重试。
+  - `_init_idle_mode()` 启动只做一次 `os.listdir` 查文件，不读图；缺帧 / 缺目录 →
+    配置在内存里退回 normal，日志只记一次；**不碰移动模式**。
+  - `tick()` 每 5 秒（`t % 250`）查一次素材还在不在；目录改名 / 删帧 →
+    `set_idle_mode("normal")`，带 `prev_key + cross_t` 淡出。
+- **测试**：
+  - `_work/_testutil.py` 的 `make_pet(pet)`：复制真实 config、覆盖
+    `idle_mode`（默认 normal）和 `mode=wander`、音量 0，再让 PetWindow 读临时配置。
+    所有既有测试都改成用它，不再依赖本机 config 里的 idle_mode。
+  - 跑 clear 套件：`$env:PET_TEST_IDLE_MODE = "clear"`；个别“正常站姿 / 眨眼”断言
+    在 clear 下允许 idle-NN，测试名带 `[clear 下由通透帧接管]`。
+  - `_work/test_idle_mode.py` 90 项；真鼠标
+    `_work/probe_real_mouse_idle_mode.py` 8 项（截图 `_work/shot_idle_mode_menu.png`、
+    `_work/shot_idle_mode_clear.png`）。
+  - 两套（normal / clear）全绿：test_idle_mode 90、test_anim 73、test_side_walk 50、
+    test_coin_cry 67、test_dance 35、test_rice_shake 12、test_layer_menu 20、
+    test_expr_question 34、test_new_views 25、test_anxious_sprite 10、test_walk_dir 17、
+    test_back_walk4 6、test_follow_face 6、test_starry 33。
+- **已知取舍 / 风险**：
+  - 视频人物在个别转身帧贴着画布左右边（x 到 0 / 719），共用裁剪框后画面宽度 254，
+    比正常模式的 233 宽一点；窗口本来就有左右留白，不会被裁掉。
+  - 音频 / 歌词都在仓库外：换机器、换用户名、移动 Music 目录后默认路径会失效，
+    需要改 config 里的两个路径；失效时只是没歌，不影响待机。
+  - 默认 `clear_music_path` 是主人给的「希玡不月半 / 大奶線唱」写法，和本机实际文件名
+    （希玥不月半 / DJ-夢ノ結唱）不完全一致，所以加了同目录模糊匹配兜底。
+  - 歌词时间轴是照拾音人页面的 LRC 抄的，和这个 OGG 可能有几百毫秒偏差；
+    49 句里情绪 / 表情是按主人给的风格补的，个别字以实际听到的为准。
+  - `setLoops(Infinite)` 不保证绝对无缝，OGG 循环接缝处可能有极短的间隙（Qt/FFmpeg 决定）。
+  - `clear_only_bgm_lyrics=true` 时，普通气泡（包括手动点「查看余额 / 天气」的反馈）
+    会被挡掉；点击音效没有一起静音，BGM 之外的音效仍会响。
+  - 通透模式下 token 一直隐藏，所以站着 / 走路 / 抓着她时都抓不到那枚金币；
+    想抢要先切正常模式。
+  - 歌曲 / 歌词的版权由使用者自己负责；仓库只放格式模板和说明，不放音频、不放真实歌词。
+  - 循环只有 2.75 秒（原来整段 5 秒里不止一圈）；这是为了"转完一圈就接上"故意剪短的。
+  - 没有加"设置窗口"里的入口，只按要求放了右键菜单；以后要加可在设置页复用
+    `set_idle_mode()`。
+  - 视频里偶发帧的脚底投影已用颜色比例判据清掉；AI 源本身边缘有 1px 压缩杂色，
+    和现有 dance / walk_side 素材同一水平，没有再做更重的锐化 / 抠色。
+
 ## v1.1.6 追加（2026-10-18：金币被抢改"先着急再哭，不还就一直哭" + 台词炸毛）
 
 需求：金币被拖走后先着急、再哭、不还就一直哭；还回来直接回待机；台词改成"炸毛"口吻、越拖越凶。
