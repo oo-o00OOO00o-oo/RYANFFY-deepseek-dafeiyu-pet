@@ -2,6 +2,59 @@
 
 ## v1.1.6（未发布）
 
+### 高兴跳舞 / 抢 token 哭有声音了
+
+- 点右键「动作 → 高兴跳舞」：会同时播一段 5.06 秒的舞蹈音乐，和 61 帧动作对齐；
+  跳完自动停。
+- 金币刚被抢走时：播 `cry_start.m4a`（2563ms，从 0 开始）—— 开头那声「哎」和铺垫都在这里；
+  它放完后**自动接** `cry_loop.m4a`（713ms，纯哭声尾段）并**原生无限循环**。
+- 哭段（cry / sobj）不打断还在放的 `cry_start`；它放完自动接 `cry_loop`。
+  金币还回来或跳舞打断时立刻停。
+- **全程不做 seek**：两段都从 0 播，`cry_loop` 用 `QMediaPlayer.setLoops(Infinite)`；
+  不再有 `setPosition(3350)` 和 `EndOfMedia → seek → play` 那套空转。
+- 音量跟设置里的音量走（动作音轨按 0.8 的相对音量）；「音效」关掉时不播。
+- 两段音频和通透模式的 BGM 是**两套独立播放器**，不会互相抢；同一时间只播一条动作音轨。
+- 音频文件已放进仓库：`assets/sfx/dance.m4a`（84 KB）、`assets/sfx/cry_start.m4a`（43 KB）、
+  `assets/sfx/cry_loop.m4a`（12 KB）；哭声两段合计 55 KB。旧的整轨 `cry.m4a` 已删除。
+
+- 实测：`dance.m4a` 5056ms、`cry_start.m4a` 2563ms、`cry_loop.m4a` 713ms；
+  Qt FFmpeg 后端直接播，没有转码。
+- 实测：真机探针 `_work/probe_cry_clips.py` 分别播两段各 1 秒：
+  `cry_start` `PlayingState` / position 891 / duration 2563；
+  `cry_loop` `PlayingState` / position 620（已自然循环）/ duration 713。
+- 实测：新增 `_work/test_action_sfx.py` **39 项全过** —— 文件存在 / 体积 / 时长；
+  跳舞从 0 起播、音量 0.4（设置 0.5 × 0.8）、进度在走、重触发换新音轨、跳完收掉；
+  抢走先播 cry_start、哭段不打断、放完自动接 cry_loop、cry_loop 原生循环一轮仍在播；
+  代码里没有 setPosition；金币还回来收掉哭声；金币释放不会误停跳舞音轨；
+  动作音轨不会被当成外部歌曲；和通透 BGM 是两个播放器；缺文件 / 关音效静默不崩。
+- 回归：normal / clear 两套全绿（`test_action_sfx` 39、`test_idle_mode` 90、
+  `test_anim` 73、`test_side_walk` 50、`test_coin_cry` 67、`test_dance` 35、
+  `test_rice_shake` 12、`test_layer_menu` 20、`test_expr_question` 34、
+  `test_new_views` 25、`test_anxious_sprite` 10、`test_walk_dir` 17、
+  `test_back_walk4` 6、`test_follow_face` 6、`test_starry` 33）；编译通过。
+
+### 维护者相关（发版 / 仓库，不写进 Release 说明）
+
+- 音源：`D:\googel\Chibi whale maid dance.m4a` → `assets/sfx/dance.m4a`；
+  `D:\googel\clip_1.5s_to_end.m4a` → `assets/sfx/cry_start.m4a`；
+  `D:\googel\clip_3.35s_to_end.m4a` → `assets/sfx/cry_loop.m4a`。
+  没有转码、没改扩展名；旧的整轨 `assets/sfx/cry.m4a` 已删除。
+- 常量在 `桌宠.py`：`SFX_DANCE_PATH / SFX_CRY_START_PATH / SFX_CRY_LOOP_PATH / ACTION_SFX`。
+- 播放器：`_play_sfx_media(path, volume=0.8, loop=False)` / `_stop_sfx_media()`，
+  独立字段 `_sfx_player / _sfx_audio / _sfx_volume / _sfx_path / _sfx_loop /
+  _sfx_started_at`，不和 `_clear_music` 共用。
+- **全代码没有 setPosition**：两段 cry 都从 0 播；`loop=True` 时用
+  `setLoops(QMediaPlayer.Loops.Infinite)`，不做手工回跳。
+- 触发点：`start_action()` 播 dance；`_stop_action()` 停；`_coin_enter("grab")` 播
+  cry_start（不循环）；`_coin_enter("cry"/"sobj")` 只确保 cry_loop 在播，cry_start
+  没放完就不打断；`EndOfMedia` 时如果当前是 cry_start 且金币还在被抢，自动接
+  cry_loop；`_coin_release()` 只停两段 cry（用 `_sfx_path` 判断，避免误停跳舞）；
+  `quit_app()` 收尾。
+- 保险：`play()` 后 0.35 秒内就 EndOfMedia（坏文件 / 解码异常）→ 只 stop + 打印日志；
+  循环音轨（`_sfx_loop=True`）如果异常 EndOfMedia 也只 stop + 日志，**不 seek、不重播**。
+- 动作音轨播放期间 `_apply_now_playing()` 不接外部媒体会话，免得 Windows 把它当成
+  “切到某首歌”冒泡。
+
 ### 通透模式待机：站着时会自己东张西望
 
 - 右键 →「待机模式」→「通透模式」：她站着不动时换成一段视频待机循环 ——
