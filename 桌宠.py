@@ -8051,11 +8051,11 @@ class PetWindow(QWidget):
                 and status == QMediaPlayer.MediaStatus.EndOfMedia):
             self._stop_sfx_media()
 
-    def _play_sfx_media(self, path, start_ms=0, volume=0.8, loop=False):
+    def _play_sfx_media(self, path, start_ms=0, volume=0.8, loop=False, loop_start_ms=None):
         """播一条一次性音轨（跳舞 / 哭）；和通透模式 BGM 完全分开。
 
         `volume` 是相对音量，最终音量 = 设置里的音量 × volume。
-        `loop=True`：播到结尾后回到 `start_ms` 继续（哭的尾段用这个循环）。
+        `loop=True`：播到结尾后回到 `loop_start_ms`（不给就用 start_ms）继续。
         文件不存在 / 解码失败就静默返回 False，不弹窗、不报错。
         """
         self._stop_sfx_media()
@@ -8074,7 +8074,9 @@ class PetWindow(QWidget):
             self._sfx_volume = factor
             self._sfx_path = path
             self._sfx_loop = bool(loop)
-            self._sfx_loop_start = int(start_ms) if loop else 0
+            self._sfx_loop_start = (int(loop_start_ms)
+                                    if (loop and loop_start_ms is not None)
+                                    else (int(start_ms) if loop else 0))
             seeked = [False]
 
             def on_status(status):
@@ -8591,12 +8593,16 @@ class PetWindow(QWidget):
             except Exception:
                 self._cry_broken = True
         if stage == "grab":
-            # 刚抢走那一下先放开头的一声"哎"（前 3.3 秒里唯一的声音）
-            self._play_sfx_media(SFX_CRY_PATH, 0)
+            # 刚抢走那一下从音频开头播起（"哎"就在这里），整段只播一次；
+            # 播到结尾后自动回到 3350ms 的哭声段循环。
+            self._play_sfx_media(SFX_CRY_PATH, 0, loop=True,
+                                 loop_start_ms=SFX_CRY_START_MS)
         elif stage == "cry" and not self._cry_broken:
-            # 前 3.3 秒是安静的，从 3350ms 起才是哭声（和最后 16 帧对齐）；
-            # 尾段循环播，别让"一直哭"变成只有第一遍有声音。
-            self._play_sfx_media(SFX_CRY_PATH, SFX_CRY_START_MS, loop=True)
+            # B 段不打断第一遍：让抢走时起播的整段音频继续走完，再循环哭声尾段。
+            # 只有"没有在播 / 播的不是 cry"（比如直接调到这里）才从开头补一次。
+            if self._sfx_player is None or self._sfx_path != SFX_CRY_PATH:
+                self._play_sfx_media(SFX_CRY_PATH, 0, loop=True,
+                                     loop_start_ms=SFX_CRY_START_MS)
         elif stage == "cry":
             # 哭帧缺失、整段退回「着急」：把抢走时那声"哎"也收掉
             self._stop_sfx_media()
