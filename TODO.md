@@ -11,9 +11,10 @@
     `assets/sfx/cry.m4a`（67,831 字节，4063ms；前 3.3 秒安静，哭声从 3350ms 起）
 - **路径**：`SFX_DANCE_PATH / SFX_CRY_PATH = os.path.join(ASSET_DIR, "sfx", ...)`，
   跟 `assets/` 一起打包（`桌宠.spec` 整目录收 assets）。
-- **播放器**：`PetWindow._play_sfx_media(path, start_ms=0, volume=0.8, loop=False)` /
-  `_stop_sfx_media()`；独立字段 `_sfx_player / _sfx_audio / _sfx_volume / _sfx_path /
-  _sfx_loop / _sfx_loop_start`，不和通透模式的 `_clear_music` / `_clear_audio` 共用。
+- **播放器**：`PetWindow._play_sfx_media(path, start_ms=0, volume=0.8, loop=False,
+  loop_start_ms=None)` / `_stop_sfx_media()`；独立字段 `_sfx_player / _sfx_audio /
+  _sfx_volume / _sfx_path / _sfx_loop / _sfx_loop_start`，不和通透模式的
+  `_clear_music` / `_clear_audio` 共用。
   - 音量 = 设置音量 × `volume`（默认 0.8）；`set_volume()` 会同步当前音轨。
   - `sound_on=False` 时不播；文件不存在 / 解码失败静默返回 False。
   - `start_ms` 在媒体未 Loaded 时会被吞掉，所以第一次 `Loaded/Buffered/Buffering`
@@ -23,13 +24,15 @@
 - **触发点**：
   - `start_action("高兴跳舞")` → `ACTION_SFX` 查表 → 播 dance，从 0。
   - `_stop_action()` → 停；重复触发先停旧再开新。
-  - `_coin_enter("grab")` → 播 cry.m4a 开头一声「哎」（start_ms=0，不循环）。
-  - `_coin_enter("cry")`（B 段）→ 从 3350ms 播，`loop=True`；`_cry_broken` 时不播并收掉「哎」。
+  - `_coin_enter("grab")` → `_play_sfx_media(cry, 0, loop=True, loop_start_ms=3350)`：
+    从开头完整播一遍（开头那声「哎」就在这里），播完自动回到 3350ms。
+  - `_coin_enter("cry")`（B 段）→ 不打断第一遍；只有确实没在播时才补播一次。
+    `_cry_broken` 时停掉并收掉「哎」。
   - `_coin_release()` → 只停 cry（`_sfx_path == SFX_CRY_PATH`），避免误停跳舞音轨。
   - `quit_app()` → 收尾。
 - **媒体会话**：动作音轨播放期间 `_apply_now_playing()` 直接忽略外部信息，
   免得 Windows 把它当成“切到某首歌”冒泡 / 顶掉气泡。
-- **测试**：`_work/test_action_sfx.py` 35 项；normal / clear 两套全绿。
+- **测试**：`_work/test_action_sfx.py` 36 项；normal / clear 两套全绿。
 - **已知取舍 / 风险**：
   - 动作音频和通透 BGM 同时存在时会有两条 QMediaPlayer；目前各自独立音量，
     没有做“BGM 自动 ducking（压低）”这种混音处理。

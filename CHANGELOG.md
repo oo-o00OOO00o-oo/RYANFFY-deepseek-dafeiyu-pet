@@ -6,20 +6,21 @@
 
 - 点右键「动作 → 高兴跳舞」：会同时播一段 5.06 秒的舞蹈音乐，和 61 帧动作对齐；
   跳完自动停。
-- 金币刚被抢走时：先播 `cry.m4a` 开头的那一声「哎」。
-- 进入「哭」那一段后：从 **3350ms** 开始播哭声（跳过前面 3.3 秒安静段，对齐最后 16 帧），
-  并且**尾段循环播放**，一直哭就一直有声音；金币还回来或跳舞打断时立刻停。
+- 金币刚被抢走时：从 `cry.m4a` 开头（0ms）播**完整一遍** —— 开头那声「哎」就在这里；
+  前 3.3 秒是安静的，所以第一遍会先「哎」再等一会儿才进入哭声。
+- 第一遍播完后：回到 **3350ms** 的哭声段**循环播放**，一直哭就一直有声音；
+  中间不打断第一遍、不提前跳 3350。金币还回来或跳舞打断时立刻停。
 - 音量跟设置里的音量走（动作音轨按 0.8 的相对音量）；「音效」关掉时不播。
 - 两段音频和通透模式的 BGM 是**两套独立播放器**，不会互相抢；同一时间只播一条动作音轨。
 - 音频文件已放进仓库：`assets/sfx/dance.m4a`（82 KB）、`assets/sfx/cry.m4a`（66 KB）。
 
 - 实测：`dance.m4a` 5056ms、`cry.m4a` 4063ms；Qt FFmpeg 后端直接播，没有转码。
-- 实测：新增 `_work/test_action_sfx.py` **35 项全过** —— 文件存在 / 体积 / 时长；
+- 实测：新增 `_work/test_action_sfx.py` **36 项全过** —— 文件存在 / 体积 / 时长；
   跳舞从 0 起播、音量 0.4（设置 0.5 × 0.8）、进度在走、重触发换新音轨、跳完收掉；
-  抢走瞬间从 cry.m4a 开头播一声「哎」、哭段从 3350ms 起播（实测 3529ms）并循环一轮
-  仍在播；金币还回来收掉哭声；金币释放不会误停跳舞音轨；
+  抢走瞬间从 cry.m4a 开头播完整一遍（起点 0、循环起点 3350）、哭段不打断第一遍、
+  第一遍走完后仍在播并回到 3350ms；金币还回来收掉哭声；金币释放不会误停跳舞音轨；
   动作音轨不会被当成外部歌曲；和通透 BGM 是两个播放器；缺文件 / 关音效静默不崩。
-- 回归：normal / clear 两套全绿（`test_action_sfx` 35、`test_idle_mode` 90、
+- 回归：normal / clear 两套全绿（`test_action_sfx` 36、`test_idle_mode` 90、
   `test_anim` 73、`test_side_walk` 50、`test_coin_cry` 67、`test_dance` 35、
   `test_rice_shake` 12、`test_layer_menu` 20、`test_expr_question` 34、
   `test_new_views` 25、`test_anxious_sprite` 10、`test_walk_dir` 17、
@@ -34,9 +35,10 @@
 - 播放器：`_play_sfx_media(path, start_ms, volume, loop)` / `_stop_sfx_media()`，独立字段
   `_sfx_player / _sfx_audio / _sfx_volume / _sfx_path / _sfx_loop / _sfx_loop_start`，
   不和 `_clear_music` 共用。
-- 触发点：`start_action()` 播 dance；`_stop_action()` 停；`_coin_enter("grab")` 播
-  cry 开头一声「哎」；`_coin_enter("cry")` 用 `loop=True` 从 3350ms 循环；
-  `EndOfMedia` 时如果 `_sfx_loop` 就 `setPosition(3350)` 再播；`_coin_release()` 只停 cry
+- 触发点：`start_action()` 播 dance；`_stop_action()` 停；`_coin_enter("grab")` 用
+  `_play_sfx_media(cry, 0, loop=True, loop_start_ms=3350)` 播完整一遍；
+  `_coin_enter("cry")` 不打断这遍（只有确实没在播时才补播）；`EndOfMedia` 时
+  如果 `_sfx_loop` 就 `setPosition(_sfx_loop_start)` 再播；`_coin_release()` 只停 cry
   （用 `_sfx_path` 判断，避免误停跳舞）；`quit_app()` 收尾。
 - `cry.m4a` 的 `setPosition(3350)` 在媒体未 Loaded 时会被吞掉，所以 `_play_sfx_media()`
   在第一次 `Loaded/Buffered/Buffering` 状态再 seek 一次。
