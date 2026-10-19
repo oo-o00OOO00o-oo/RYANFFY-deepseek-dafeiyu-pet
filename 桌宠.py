@@ -1632,6 +1632,15 @@ WALK_FRAMES = {
 ACTION_CLIPS = {"高兴跳舞": ("dance", 61)}
 ACTION_SAMPLE_FPS = 12.0      # 素材采样率：视频 24fps，每 2 帧取 1 帧 = 5.08 秒
 
+# 一次性动作音轨（进仓库，跟着 assets/ 一起打包）：
+#   dance.m4a 5056ms，和舞蹈 61 帧对齐；cry.m4a 4063ms，前 3.3 秒安静，
+#   从 3350ms 起才是哭，和"最后 16 帧"对齐。
+SFX_DANCE_PATH = os.path.join(ASSET_DIR, "sfx", "dance.m4a")
+SFX_CRY_PATH = os.path.join(ASSET_DIR, "sfx", "cry.m4a")
+SFX_CRY_START_MS = 3350
+# 动作名 → (音轨路径, 起始毫秒)；以后加动作音效往这里加一行
+ACTION_SFX = {"高兴跳舞": (SFX_DANCE_PATH, 0)}
+
 # ---------- 通透模式待机（视频抽帧的"多角度东张西望"） ----------
 # sprites/idle_clear/idle-01…33：源片 24fps 重采样到 12fps 后，只截一圈
 # （12fps 第 21~53 帧，正面→背影→正面），共用一个裁剪框（254x306）。
@@ -4950,6 +4959,11 @@ class PetWindow(QWidget):
         self._clear_music_warned = False
         self._clear_lyric_index = -1
         self._clear_lyrics = self._load_clear_lyrics()
+        # 一次性动作音轨（跳舞 / 哭）：独立于通透模式的 BGM，同一时间只播一条
+        self._sfx_player = None
+        self._sfx_audio = None
+        self._sfx_volume = 0.0
+        self._sfx_path = ""
         self._migrate_skin_library()      # 老配置里直接存的图片路径 → 搬进「我的形象库」
         self._rebuild_sprites()
         self.icon = QIcon(os.path.join(SPRITE_DIR, "icon.png"))
@@ -5562,6 +5576,10 @@ class PetWindow(QWidget):
             self._lyric_timer.stop()
 
     def _apply_now_playing(self, info):
+        # 我们自己的一次性动作音轨（跳舞 / 哭）也会出现在 Windows 媒体会话里；
+        # 播放这几秒内不接外部"在放什么"，免得冒一句「切到…啦」或把气泡顶掉。
+        if info is not None and getattr(self, "_sfx_player", None) is not None:
+            return
         # 通透模式自己放 BGM 时，Windows 媒体会话里也会出现这首歌：
         # 不认出来的话会冒一句「切到《朋友的酒》啦」，把气泡里的歌词顶掉。
         # 默认只忽略这首自己的 BGM；开了 clear_only_bgm_lyrics 才屏蔽所有外部媒体。
@@ -6205,6 +6223,8 @@ class PetWindow(QWidget):
     def set_sound(self, on):
         self.sound_on = bool(on)
         self.cfg["sound_on"] = bool(on)
+        if not self.sound_on:
+            self._stop_sfx_media()
 
     def set_sound_set(self, name):
         if name not in self._sound_names():
@@ -6347,6 +6367,12 @@ class PetWindow(QWidget):
         if self._clear_audio is not None:
             try:
                 self._clear_audio.setVolume(self.volume)
+            except Exception:
+                pass
+        if self._sfx_audio is not None:
+            try:
+                self._sfx_audio.setVolume(
+                    max(0.0, min(1.0, self.volume * self._sfx_volume)))
             except Exception:
                 pass
         self._restore_sound_volume()
@@ -7990,6 +8016,89 @@ class PetWindow(QWidget):
         seconds = max(1.5, min(12.0, (end_ms - start_ms) / 1000.0 + 0.35))
         self.say(text, seconds=seconds, again=True, lyric=True)
 
+    # ---------- 一次性动作音轨（跳舞 / 哭） ----------
+    def _stop_sfx_media(self):
+        """停掉当前的一次性音轨；没有就什么都不做。"""
+        player = self._sfx_player
+        audio = self._sfx_audio
+        self._sfx_player = None
+        self._sfx_audio = None
+        self._sfx_volume = 0.0
+        self._sfx_path = ""
+        if player is not None:
+            try:
+                player.stop()
+                player.setSource(QUrl())
+            except Exception:
+                pass
+            try:
+                player.deleteLater()
+            except Exception:
+                pass
+        if audio is not None:
+            try:
+                audio.deleteLater()
+            except Exception:
+                pass
+
+    def _on_sfx_media_status(self, status, player):
+        """一条音轨自然播完就收掉，别让它占着播放器 / 设备。"""
+        if (player is self._sfx_player
+                and status == QMediaPlayer.MediaStatus.EndOfMedia):
+            self._stop_sfx_media()
+
+    def _play_sfx_media(self, path, start_ms=0, volume=0.8):
+        """播一条一次性音轨（跳舞 / 哭）；和通透模式 BGM 完全分开。
+
+        `volume` 是相对音量，最终音量 = 设置里的音量 × volume。
+        文件不存在 / 解码失败就静默返回 False，不弹窗、不报错。
+        """
+        self._stop_sfx_media()
+        if not getattr(self, "sound_on", True):
+            return False
+        if not AUDIO_AVAILABLE or not path or not os.path.exists(path):
+            return False
+        try:
+            factor = max(0.0, min(1.0, float(volume)))
+            player = QMediaPlayer(self)
+            audio = QAudioOutput(self)
+            audio.setVolume(max(0.0, min(1.0, self.volume * factor)))
+            player.setAudioOutput(audio)
+            self._sfx_player = player
+            self._sfx_audio = audio
+            self._sfx_volume = factor
+            self._sfx_path = path
+            seeked = [False]
+
+            def on_status(status):
+                if player is not self._sfx_player:
+                    return
+                if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                    self._on_sfx_media_status(status, player)
+                    return
+                # setPosition 在媒体还没 Loaded 时会被吞掉：等第一次 Buffered/Loaded
+                # 再 seek 一次，cry.m4a 才能从 3350ms 的哭声开始。
+                if (start_ms and start_ms > 0 and not seeked[0]
+                        and status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                                       QMediaPlayer.MediaStatus.BufferedMedia,
+                                       QMediaPlayer.MediaStatus.BufferingMedia)):
+                    seeked[0] = True
+                    player.setPosition(int(start_ms))
+                    if (player.playbackState()
+                            != QMediaPlayer.PlaybackState.PlayingState):
+                        player.play()
+
+            player.mediaStatusChanged.connect(on_status)
+            player.setSource(QUrl.fromLocalFile(path))
+            if start_ms and start_ms > 0:
+                player.setPosition(int(start_ms))
+            player.play()
+            return True
+        except Exception:
+            self._stop_sfx_media()
+            return False
+
+
     def _has_anim_frames(self, view, h):
         """这个方向的动画帧有没有加载（决定静态图要不要按"不裁边"再取一遍）。
 
@@ -8062,6 +8171,9 @@ class PetWindow(QWidget):
         self.action_name = name
         self._action_started = now
         self.action_until = now + ACTION_CLIPS[name][1] / ACTION_SAMPLE_FPS
+        sfx = ACTION_SFX.get(name)
+        if sfx:
+            self._play_sfx_media(sfx[0], sfx[1])
         # 动作画面里没有金币：跳舞期间先把它收起来，别贴在衣服前面挡动作。
         # （_rice_tick 里也有同样的一道闸，否则"饭碗不见了就自愈"会每帧又把它放出来。）
         bowl = getattr(self, "_rice", None)
@@ -8087,6 +8199,7 @@ class PetWindow(QWidget):
         if self.action_until <= 0:
             return
         prev = self._sprite_key()          # 还在播 → 这一张是最后一帧
+        self._stop_sfx_media()             # 动作音轨跟着动作一起收
         self.action_name = ""
         self.action_until = 0.0
         self._action_started = 0.0
@@ -8465,6 +8578,9 @@ class PetWindow(QWidget):
                     self._cry_broken = True
             except Exception:
                 self._cry_broken = True
+        if stage == "cry" and not self._cry_broken:
+            # 前 3.3 秒是安静的，从 3350ms 起才是哭声（和最后 16 帧对齐）
+            self._play_sfx_media(SFX_CRY_PATH, SFX_CRY_START_MS)
         lines = COIN_STOLEN_LINES.get(stage) or []
         if lines:
             if stage == "sobj":
@@ -8519,6 +8635,8 @@ class PetWindow(QWidget):
         `say_line=False` 用于"跳舞 / 换形象把金币收起来"这种和"还回来"无关的清场。
         """
         had_cried = self._coin_stage in ("cry", "sobj")
+        if self._sfx_path == SFX_CRY_PATH:
+            self._stop_sfx_media()         # 只收哭声；别把同时播的跳舞音轨误停
         self.prev_key = self._sprite_key()     # 当前这张（哭 / 着急）淡回待机
         self.cross_t = 1.0
         self._coin_stage = None
@@ -12617,6 +12735,8 @@ class PetWindow(QWidget):
 
     def quit_app(self):
         self._unregister_hotkeys()        # 全局快捷键要还给系统，不然退出后这个键就废了
+        self._stop_sfx_media()
+        self._pause_clear_music()
         try:
             self.app_time_flush()         # 今天用了多久：退出前落一次盘
         except Exception:
