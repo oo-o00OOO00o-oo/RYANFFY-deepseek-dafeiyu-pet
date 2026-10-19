@@ -40,7 +40,7 @@ from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice
                             QObject)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
                            QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen,
-                           QPainterPath, QLinearGradient)
+                           QPainterPath, QLinearGradient, QActionGroup)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
 try:
     from PySide6.QtMultimedia import QSoundEffect
     from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
     AUDIO_AVAILABLE = True
 except Exception:
     AUDIO_AVAILABLE = False
@@ -194,7 +195,8 @@ SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
 #   base/ 正面侧面背面 · idle/ 待机眨眼 · walk_side/ 侧向行走 · walk_back/ 背影行走 · expr/ 表情
 #   cry/ 金币被抢后哭的 16 帧（见下方「金币被抢」那段，懒加载）
 # 加载按这个顺序找；根目录也查一遍，老布局（图片直接摊在 sprites/ 下）照样能用。
-SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "cry", "expr", "dance", "")
+SPRITE_SUBDIRS = ("base", "idle", "walk_side", "walk_back", "cry", "expr", "dance",
+                  "idle_clear", "")
 
 
 def sprite_file(name):
@@ -1629,6 +1631,49 @@ WALK_FRAMES = {
 # 所以动作再多也不会拖慢启动。
 ACTION_CLIPS = {"高兴跳舞": ("dance", 61)}
 ACTION_SAMPLE_FPS = 12.0      # 素材采样率：视频 24fps，每 2 帧取 1 帧 = 5.08 秒
+
+# ---------- 通透模式待机（视频抽帧的"多角度东张西望"） ----------
+# sprites/idle_clear/idle-01…33：源片 24fps 重采样到 12fps 后，只截一圈
+# （12fps 第 21~53 帧，正面→背影→正面），共用一个裁剪框（254x306）。
+# 源片后面还有半圈"往右转"的余量，剪掉后首尾都是正面，循环不会突然跳回正面。
+# 和走路 / 动作一样**懒加载**：正常模式启动不读这个目录，第一次切到通透才加载。
+CLEAR_IDLE_SUBDIR = "idle_clear"
+CLEAR_IDLE_FPS = 12.0
+CLEAR_IDLE_COUNT = 33
+CLEAR_IDLE_FRAMES = tuple("idle-%02d" % i for i in range(1, CLEAR_IDLE_COUNT + 1))
+CLEAR_IDLE_FRAME_SET = frozenset(CLEAR_IDLE_FRAMES)
+CLEAR_IDLE_ANIM_SEC = CLEAR_IDLE_COUNT / CLEAR_IDLE_FPS    # 整段播一遍 = 2.75 秒
+
+# 通透模式的循环 BGM：音频/歌词由使用者自备，仓库不包含版权素材。
+# 默认路径按本机 Music 目录写；config.json 里可以用 clear_music_path /
+# clear_lyrics_path 改成别的位置。文件不存在就静默不播，不报错。
+CLEAR_MUSIC_DEFAULT = r"C:\Users\16050\Music\希玡不月半 - 朋友的酒 (DJ-大奶線唱)_L.ogg"
+CLEAR_LYRICS_DEFAULT = r"C:\Users\16050\Music\希玥不月半 - 朋友的酒 (DJ-夢ノ結唱)_L.lyrics.txt"
+
+
+def load_clear_idle_lyrics(path):
+    """读歌词（mm:ss.xx|歌词）；文件缺了 / 行坏了就跳过，返回 [(毫秒, 文本)]。"""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw or raw.startswith("#") or "|" not in raw:
+                    continue
+                stamp, text = raw.split("|", 1)
+                try:
+                    mm, ss = stamp.strip().split(":")
+                    ms = int(round((int(mm) * 60 + float(ss)) * 1000))
+                except (TypeError, ValueError):
+                    continue
+                text = text.strip()
+                if text:
+                    out.append((ms, text))
+    except OSError:
+        return []
+    out.sort(key=lambda item: item[0])
+    return out
+
 
 # ---------- 状态表情（照 DSH 插件那套改的，模型见 TODO/CHANGELOG） ----------
 # 桌宠当前"心情"，由 DSH 真实状态驱动：
@@ -4764,6 +4809,13 @@ class PetWindow(QWidget):
         cfg_defaults = {
             "mode": "wander",
             "size": 0.7,
+            # 待机模式：normal = 原来那套（正面 + 眨眼）；clear = 通透模式（视频抽帧循环）
+            "idle_mode": "normal",
+            # 通透模式 BGM：音频/歌词由使用者自备，路径在配置里改
+            "clear_music_path": CLEAR_MUSIC_DEFAULT,
+            "clear_lyrics_path": CLEAR_LYRICS_DEFAULT,
+            # true = 通透模式气泡只显示 BGM 歌词；默认 false，气泡行为和正常模式一致
+            "clear_only_bgm_lyrics": False,
             "topmost": True,
             "passthrough": False,
             "autostart": False,
@@ -4845,6 +4897,9 @@ class PetWindow(QWidget):
         self.cfg = load_json(CONFIG_PATH, dict(cfg_defaults))
         for cfg_key, cfg_value in cfg_defaults.items():
             self.cfg.setdefault(cfg_key, cfg_value)
+        # 老配置里没有 idle_mode / 存了别的值：一律当正常模式，别让脏值传到下面
+        if self.cfg.get("idle_mode") not in ("normal", "clear"):
+            self.cfg["idle_mode"] = "normal"
         # 界面配色一上来就按配置定下来：气泡风格选「跟随界面」时要看这个亮暗，
         # 老对话框取主题色也走同一套 —— 以前是等设置窗口建出来才 set_mode，
         # 那样"刚启动、还没开过设置"的时候气泡会按系统的亮暗走，不是主人选的那档。
@@ -4884,6 +4939,17 @@ class PetWindow(QWidget):
         self.sprites = {}
         self.custom_skin_ok = {}
         self._base_cache = {}             # 原始大图（裁过透明边）的缓存：无级调节要反复缩放，不能每次都读盘
+        # 通透待机帧：单独缓存（不塞进启动批量加载），只记当前高度这一套
+        self._clear_idle_h = None
+        self._clear_idle_pix = None       # [(帧名, QPixmap)]；None = 这个高度加载失败
+        self._clear_idle_warned = False   # 素材缺失只在日志里说一次，不弹窗
+        # 通透模式的 BGM：第一次进 clear 才建播放器，切回 normal 只暂停不销毁
+        self._clear_music = None
+        self._clear_audio = None
+        self._clear_music_failed = False
+        self._clear_music_warned = False
+        self._clear_lyric_index = -1
+        self._clear_lyrics = self._load_clear_lyrics()
         self._migrate_skin_library()      # 老配置里直接存的图片路径 → 搬进「我的形象库」
         self._rebuild_sprites()
         self.icon = QIcon(os.path.join(SPRITE_DIR, "icon.png"))
@@ -4899,6 +4965,9 @@ class PetWindow(QWidget):
         # 否则第一帧就没图可画
         self._ensure_sprites(self.cur_h)
         self._apply_window_size()
+        # 上次选的通透模式，这次启动时素材却不在（目录改名 / 删帧）：
+        # 先退回正常模式，不读盘、不弹窗；用户下次点菜单还会重试。
+        self._init_idle_mode()
 
         # ===== 白饭碗（后加的功能）=====
         self._rice = None
@@ -5493,6 +5562,15 @@ class PetWindow(QWidget):
             self._lyric_timer.stop()
 
     def _apply_now_playing(self, info):
+        # 通透模式自己放 BGM 时，Windows 媒体会话里也会出现这首歌：
+        # 不认出来的话会冒一句「切到《朋友的酒》啦」，把气泡里的歌词顶掉。
+        # 默认只忽略这首自己的 BGM；开了 clear_only_bgm_lyrics 才屏蔽所有外部媒体。
+        if (info is not None and self.cfg.get("idle_mode") == "clear"
+                and self._clear_music is not None):
+            if self._clear_lyrics_only():
+                return
+            if "朋友的酒" in (info.get("title") or ""):
+                return
         now = time.time()
         # 播放器不给进度时，靠这里累计的"播放了多少秒"来对歌词
         if self.now_playing and self.now_playing.get("playing") and self._music_tick_at:
@@ -5790,6 +5868,8 @@ class PetWindow(QWidget):
         "用久了 / 到点 / 快捷键"那句顶掉）：先记着，等它说完再顶上来。
         主人自己点的那种（快速双击看一眼余额）传 force=True，直接顶。
         """
+        if self._clear_lyrics_only():
+            return
         if not force and self._trigger_speaking():
             self._bal_wait_until = self._trigger_until + 0.15
             self._bal_wait_secs = seconds
@@ -6264,6 +6344,11 @@ class PetWindow(QWidget):
         self.cfg["volume"] = self.volume
         if self._click_player:
             self._click_player.volume = self.volume
+        if self._clear_audio is not None:
+            try:
+                self._clear_audio.setVolume(self.volume)
+            except Exception:
+                pass
         self._restore_sound_volume()
 
     # ---------- 形象加载 / 我的形象库（两本：三维形象 / 挂件形象）----------
@@ -7234,6 +7319,11 @@ class PetWindow(QWidget):
 
         放歌时歌词优先于「余额常显」——想瞄一眼余额就快速双击（显示 5 秒）。
         """
+        if self._clear_lyrics_only():
+            # 通透模式只放歌词：余额 / 外部歌词 / 问答卡片都不进气泡
+            if self.bubble_text and now < self.bubble_until:
+                return "text"
+            return None
         if (self.bubble_text or self.bubble_card) and now < self.bubble_until:
             return "text"
         if self.now_playing and now < self._bal_peek_until and self.balance is not None:
@@ -7535,7 +7625,10 @@ class PetWindow(QWidget):
                     self.facing if self.dir in ("left", "right") else 1)
         name = {"left": "侧面", "right": "侧面", "up": "背面", "down": "正面"}[self.dir]
         name = self._anim_frame_name(name)
-        return (name, self.cur_h, self.facing if self.dir in ("left", "right") else 1)
+        # 通透待机是视频里的多角度画面，本身就带着朝向，别再按左右走的方向镜像
+        facing = 1 if name in CLEAR_IDLE_FRAME_SET else (
+            self.facing if self.dir in ("left", "right") else 1)
+        return (name, self.cur_h, facing)
 
     # ---------- 状态表情（照 DSH 插件那套"状态驱动"改的） ----------
     def set_pet_state(self, state):
@@ -7561,12 +7654,15 @@ class PetWindow(QWidget):
     def _anim_frame_name(self, name):
         """帧动画：待机眨眼、行走换帧、状态表情、一次性动作。帧图没加载就退回静态图（不报错）。
 
-        优先级：**一次性动作 > 状态表情 / 拖拽 > 行走帧 > 待机眨眼**。
+        优先级：**一次性动作 > 状态表情 / 拖拽 > 行走帧 > 通透待机 > 正常待机眨眼**。
         - 一次性动作：右键「动作」里点的那段（见 ACTION_CLIPS），播完自动回原样；
           素材缺一张就整套跳过，不会报错。
         - 状态表情：DSH 等你点头/回答 → 着急；出错过 → 圈圈眼（一次性）；
           被你拖着 → 拖拽姿势（见 `PET_EXPR_FRAMES`，缺图自动跳过）
-        - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）
+        - 通透待机（idle_mode="clear"）：**站着不动**时循环 `idle_clear` 的视频帧；
+          走起来 / 被拖 / 有动作时让位给下面的逻辑。素材缺了自动当没开。
+        - 正面：眨眼的 0.16 秒里换闭眼帧（站着或往下走都会眨）；通透模式不眨眼
+          （素材自己带表情变化，再叠眨眼会怪）。
         - 侧面：走起来按 `SIDE_WALK_FRAMES` 那 12 帧循环，**节奏固定在
           SIDE_WALK_ANIM_SEC（0.9 秒一个循环 ≈ 两步）**，和移动速度解耦
           （`WALK_FREQ` 那条相位是给颠簸用的，步频和动画节奏不是一回事）。
@@ -7582,8 +7678,14 @@ class PetWindow(QWidget):
         if expr:
             return expr
         now = self._secs()
+        clear = self._clear_idle_frame_name(now)
+        if clear:
+            return clear
+        clear_on = (self.cfg.get("idle_mode") == "clear"
+                    and self._clear_idle_pix is not None)
         if name == "正面":
-            if now < self._blink_until and ("正面-眨", self.cur_h) in self.sprites:
+            if (not clear_on and now < self._blink_until
+                    and ("正面-眨", self.cur_h) in self.sprites):
                 return "正面-眨"
             return name
         frames = WALK_FRAMES.get(name)
@@ -7607,6 +7709,286 @@ class PetWindow(QWidget):
         """侧面走路的新 12 帧是否全部就位（缺任何一帧就整段退回旧的 3 帧逻辑）。"""
         h = self.cur_h
         return all((f, h) in self.sprites for f in SIDE_WALK_FRAMES)
+
+    # ---------- 通透模式待机（视频抽帧） ----------
+    def _init_idle_mode(self):
+        """启动时把上次选的待机模式接上；素材不在就退回正常模式。
+
+        这里**只查文件在不在**（一次 os.listdir），不读 33 张图 ——
+        真正读盘要等第一次画到通透待机（见 `_clear_idle_loaded`），
+        这样正常的启动速度 / 内存和以前一样。
+        通透模式**不碰**移动模式：散步 / 跟随 / 原地待着都照旧。
+        """
+        if self.cfg.get("idle_mode") != "clear":
+            return
+        if self._clear_idle_assets_present():
+            return
+        self._log_clear_idle_unavailable("启动时找不到 sprites/idle_clear 的完整帧")
+        self.cfg["idle_mode"] = "normal"
+
+    def set_idle_mode(self, mode):
+        """切换待机模式（normal / clear），写进 config.json，带淡入淡出。
+
+        通透模式只影响待机画面 / BGM，**不改移动模式**；素材缺失时
+        不抛异常：退回正常模式、日志记一次，返回 False。
+        """
+        mode = mode if mode in ("normal", "clear") else "normal"
+        old = self.cfg.get("idle_mode", "normal")
+        prev = self._sprite_key()          # 先记住"原来那张"，切换时淡过去
+        if mode == "clear" and not self._clear_idle_loaded(retry=True):
+            mode = "normal"
+        if mode == "clear" and self.cfg.get("clear_only_bgm_lyrics"):
+            # 只有开了「只显示 BGM 歌词」才收掉外部气泡；默认不动
+            self.now_playing = None
+            self._lyric_key = ""
+            self._lyric_lines = []
+            self.bubble_text = ""
+            self.bubble_until = 0
+            self.bubble_card = None
+        self.cfg["idle_mode"] = mode
+        self.save_config()
+        if mode == "clear":
+            self._start_clear_music()
+        else:
+            self._pause_clear_music()
+        if mode != old:
+            self.prev_key = prev
+            self.cross_t = 1.0
+        self.update()
+        return mode == "clear"
+
+    def _clear_idle_assets_present(self):
+        """idle-01…NN 是不是一张不少（只读一次目录，不读图）。"""
+        try:
+            names = set(os.listdir(os.path.join(SPRITE_DIR, CLEAR_IDLE_SUBDIR)))
+        except OSError:
+            return False
+        return all((name + ".png") in names for name in CLEAR_IDLE_FRAMES)
+
+    def _log_clear_idle_unavailable(self, reason):
+        """素材缺失只记一次日志（打印到控制台，不弹窗、不打断主人）。"""
+        if self._clear_idle_warned:
+            return
+        self._clear_idle_warned = True
+        print("通透待机素材不可用（%s），先用正常待机" % reason)
+
+    def _clear_idle_load_failed(self, reason, h):
+        """记住"这个高度加载失败"，免得每帧都去读盘；下次手动切换会重试。"""
+        self._clear_idle_h = int(h)
+        self._clear_idle_pix = None
+        self._log_clear_idle_unavailable(reason)
+        return None
+
+    def _clear_idle_loaded(self, retry=False):
+        """当前高度的一套通透待机帧；没加载就现读（懒加载），失败返回 None。
+
+        `retry=True`：手动切模式时重试一次（目录可能被改回来了）；
+        平时每帧调用不会碰盘 —— 失败结果也缓存到 `_clear_idle_h` 上。
+        """
+        h = int(self.cur_h)
+        if self._clear_idle_h == h:
+            if self._clear_idle_pix is not None:
+                # 换形象 / 重建 sprites 后帧可能被清掉，补回去（图片还在缓存里）
+                for name, pix in self._clear_idle_pix:
+                    self.sprites[(name, h)] = pix
+                return self._clear_idle_pix
+            if not retry:
+                return None
+        if not self._clear_idle_assets_present():
+            return self._clear_idle_load_failed("sprites/idle_clear 缺帧或目录不在了", h)
+
+        frames = []
+        for name in CLEAR_IDLE_FRAMES:
+            path = sprite_file(name)
+            if not path:
+                return self._clear_idle_load_failed("缺 %s.png" % name, h)
+            pix = QPixmap(path)
+            if pix.isNull():
+                return self._clear_idle_load_failed("读不出 %s.png" % name, h)
+            if pix.height() != h:
+                # 素材只有 306 高这一档，其它高度现场等比缩（所有帧同一尺寸，不会抖）
+                pix = pix.scaledToHeight(h, Qt.TransformationMode.SmoothTransformation)
+            frames.append((name, pix))
+
+        w0, h0 = frames[0][1].width(), frames[0][1].height()
+        if any(p.width() != w0 or p.height() != h0 for _n, p in frames):
+            return self._clear_idle_load_failed("帧尺寸不一致", h)
+        self._clear_idle_h = h
+        self._clear_idle_pix = frames
+        for name, pix in frames:
+            self.sprites[(name, h)] = pix
+        return frames
+
+    def _clear_idle_frame_name(self, now):
+        """通透待机此刻该画哪一帧；不在通透模式 / 不站着 / 素材缺就返回 None。
+
+        只负责**最底层**的待机：一次性动作、金币被抢、拖拽、DSH 表情、走路
+        都在调用它的地方先被挑走了（见 `_sprite_key` / `_anim_frame_name`）。
+        """
+        if self.cfg.get("idle_mode") != "clear":
+            return None
+        if self.target is not None or self.dragging:
+            return None
+        frames = self._clear_idle_loaded()
+        if not frames:
+            return None
+        n = len(frames)
+        idx = int((now / CLEAR_IDLE_ANIM_SEC) * n) % n
+        return frames[idx][0]
+
+    def _check_clear_idle_assets(self):
+        """通透模式开着时每 5 秒确认素材还在；被改名 / 删帧就退回正常模式。"""
+        if self.cfg.get("idle_mode") != "clear":
+            return
+        if self._clear_idle_assets_present():
+            return
+        self._log_clear_idle_unavailable("通透待机素材被移走 / 删掉了")
+        self.set_idle_mode("normal")
+
+    # ---------- 通透模式 BGM + 歌词 ----------
+    def _clear_lyrics_only(self):
+        """通透模式是不是只允许 BGM 歌词（config: clear_only_bgm_lyrics，默认 false）。"""
+        return (self.cfg.get("idle_mode") == "clear"
+                and bool(self.cfg.get("clear_only_bgm_lyrics", False)))
+
+    def _resolve_clear_music_path(self):
+        """配置里的音频路径；默认那个文件名和本机实际文件名对不上时，同目录找同名的 .ogg。"""
+        raw = (self.cfg.get("clear_music_path") or "").strip()
+        if not raw:
+            return None
+        if os.path.isfile(raw):
+            return raw
+        folder = os.path.dirname(raw)
+        if folder and os.path.isdir(folder):
+            try:
+                picks = [n for n in os.listdir(folder)
+                         if n.lower().endswith(".ogg") and "朋友的酒" in n]
+                if picks:
+                    return os.path.join(folder, sorted(picks)[0])
+            except OSError:
+                pass
+        return None
+
+    def _load_clear_lyrics(self):
+        """读 config 的 clear_lyrics_path；没有就试音频同目录的 *.lyrics.txt / lyrics.txt。"""
+        raw = (self.cfg.get("clear_lyrics_path") or "").strip()
+        if raw and os.path.isfile(raw):
+            lines = load_clear_idle_lyrics(raw)
+            if lines:
+                return lines
+        music = self._resolve_clear_music_path()
+        if music:
+            base = os.path.splitext(music)[0]
+            for path in (base + ".lyrics.txt", base + ".lrc.txt",
+                         os.path.join(os.path.dirname(music), "lyrics.txt")):
+                if os.path.isfile(path):
+                    lines = load_clear_idle_lyrics(path)
+                    if lines:
+                        return lines
+        return []
+
+    def _log_clear_music_unavailable(self, reason):
+        if self._clear_music_warned:
+            return
+        self._clear_music_warned = True
+        print("通透模式 BGM 不可用（%s），只播待机动画" % reason)
+
+    def _start_clear_music(self):
+        """第一次进通透模式时建 QMediaPlayer（无限循环）；失败只记一次，不崩。"""
+        if self._clear_music is not None:
+            return True
+        if self._clear_music_failed:
+            return False
+        if not AUDIO_AVAILABLE:
+            self._clear_music_failed = True
+            self._log_clear_music_unavailable("QtMultimedia 没加载起来")
+            return False
+        music_path = self._resolve_clear_music_path()
+        if not music_path:
+            self._clear_music_failed = True
+            self._log_clear_music_unavailable(
+                "找不到 %s" % (self.cfg.get("clear_music_path") or "clear_music_path"))
+            return False
+        try:
+            player = QMediaPlayer(self)
+            audio = QAudioOutput(self)
+            audio.setVolume(self.volume)
+            player.setAudioOutput(audio)
+            player.setSource(QUrl.fromLocalFile(music_path))
+            player.setLoops(QMediaPlayer.Loops.Infinite)
+            player.errorOccurred.connect(
+                lambda _err, msg: self._log_clear_music_unavailable(msg or "播放器报错"))
+            self._clear_music = player
+            self._clear_audio = audio
+            self._clear_lyric_index = -1
+            player.play()
+            return True
+        except Exception as exc:
+            self._clear_music_failed = True
+            self._log_clear_music_unavailable(repr(exc))
+            return False
+
+    def _pause_clear_music(self):
+        try:
+            if (self._clear_music is not None
+                    and self._clear_music.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+                self._clear_music.pause()
+        except Exception:
+            pass
+
+    def _tick_clear_music(self):
+        """每帧：clear 模式放 BGM + 按播放进度换歌词；normal 只暂停，不销毁。"""
+        if self.cfg.get("idle_mode") != "clear":
+            self._pause_clear_music()
+            self._clear_lyric_index = -1
+            return
+        if not self._start_clear_music():
+            return
+        try:
+            if (self._clear_music.playbackState()
+                    != QMediaPlayer.PlaybackState.PlayingState):
+                self._clear_music.play()
+        except Exception:
+            pass
+        self._tick_clear_lyrics()
+
+    def _tick_clear_lyrics(self):
+        """按 player.position() 找当前这句；换句才 say，避免每帧重画。"""
+        player = self._clear_music
+        if player is None or not self._clear_lyrics:
+            return
+        try:
+            pos = int(player.position())
+        except Exception:
+            return
+        idx = -1
+        for i, (ms, _text) in enumerate(self._clear_lyrics):
+            if pos >= ms:
+                idx = i
+            else:
+                break
+        prev = self._clear_lyric_index
+        if idx == prev:
+            return
+        self._clear_lyric_index = idx
+        if idx < 0:
+            # 一轮播完回到开头：把上一句歌词收掉（只在上一句确实是歌词时收）
+            if prev >= 0:
+                self.bubble_text = ""
+                self.bubble_until = 0
+                self.bubble_card = None
+                self.update()
+            return
+        start_ms, text = self._clear_lyrics[idx]
+        if idx + 1 < len(self._clear_lyrics):
+            end_ms = self._clear_lyrics[idx + 1][0]
+        else:
+            try:
+                end_ms = max(start_ms + 1500, int(player.duration()))
+            except Exception:
+                end_ms = start_ms + 8000
+        seconds = max(1.5, min(12.0, (end_ms - start_ms) / 1000.0 + 0.35))
+        self.say(text, seconds=seconds, again=True, lyric=True)
 
     def _has_anim_frames(self, view, h):
         """这个方向的动画帧有没有加载（决定静态图要不要按"不裁边"再取一遍）。
@@ -8181,6 +8563,16 @@ class PetWindow(QWidget):
                 bowl.hide()
                 dsh_debug("rice: 左右走路中，金币已隐藏")
             return
+        # 通透模式：token / 金币收起来（主人 2026-10-19 明确要求恢复）。
+        # 站着 / 走路 / 被拎起来都藏；只有正在拖金币或被抢时才不藏。
+        if (self.cfg.get("idle_mode") == "clear"
+                and self._clear_idle_pix is not None
+                and self._coin_stage is None
+                and not bowl.dragging):
+            if bowl.isVisible():
+                bowl.hide()
+                dsh_debug("rice: 通透模式中，金币已隐藏")
+            return
         # 单张形象（挂件）不显示饭碗 —— 主人要求"挂件时隐藏图标"。
         # 这里每帧判一次，切形象立刻生效，不用重启。
         if not self._rice_three_view():
@@ -8281,6 +8673,7 @@ class PetWindow(QWidget):
 
     def tick(self):
         self.t += 1
+        self._tick_clear_music()   # 通透模式 BGM + 歌词
         self._rice_tick()          # 白饭碗：拖着追 / 不拖抱着
         self._dsh_bar_tick()       # DSH 状态条：贴脚下 / 收后台结果 / 自愈
 
@@ -8310,6 +8703,8 @@ class PetWindow(QWidget):
         # 大约每 5 秒顺手存一次配置：改了城市/大小/音效这些不用等退出也不会丢
         if self.t % 250 == 0:
             self.autosave_config()
+            # 通透待机开着时顺手确认素材还在（目录被改名 / 删帧就退回正常模式）
+            self._check_clear_idle_assets()
 
         # 峰谷切换提醒：每秒看一次，跨进新时段就说一声
         if self.t % 50 == 0:
@@ -9129,8 +9524,12 @@ class PetWindow(QWidget):
         with self._ui_guard():
             dlg.exec()
 
-    def say(self, text, inner=False, seconds=2.8, again=False, idle=False, queue=False):
+    def say(self, text, inner=False, seconds=2.8, again=False, idle=False, queue=False,
+            lyric=False):
         """冒一句话。
+
+        `lyric=True` 只有通透模式的 BGM 歌词会用：通透模式**只放歌词**，
+        其余所有气泡（闲聊 / 天气 / 余额 / DSH 问题 / 启动提示）在这期间一律不冒。
 
         `idle=True` 只有"闲着时自己冒话"会用（见 `_maybe_idle_action`）：
         **触发类的话优先级最高** —— 开应用 / 用久了 / 到点 / 快捷键 / 双击 / 点它 / 拖它 /
@@ -9143,6 +9542,8 @@ class PetWindow(QWidget):
         如果这会儿已经有触发类的话在说、或者队列里还排着，这句就**排在后面依次说**，
         不跟它抢（两条几乎同时来的时候，两句都能看见）。
         """
+        if self._clear_lyrics_only() and not lyric:
+            return
         if idle and text == self.last_line and not again and not text.startswith("天气"):
             return
         if queue:
@@ -9691,6 +10092,8 @@ class PetWindow(QWidget):
 
     def _announce_question(self, q):
         """把 DSH 正在问的问题冒出来（同一个问题只冒一次，别刷屏）。"""
+        if self._clear_lyrics_only():
+            return                  # 只放歌词模式下，问答卡片等切回正常再说
         qid = q.get("id") or ""
         if qid and qid in self._question_seen:
             return
@@ -9830,12 +10233,13 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：除「动作」外**没有第二条子菜单**。
+        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」两条子菜单。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
-        「动作」是 2026-10-18 加回来的唯一子菜单（真鼠标点过：悬停立刻展开、
-        点「高兴跳舞」能触发）；其余仍保持扁平，不重复那套老毛病。
+        「动作」是 2026-10-18 加回来的子菜单（真鼠标点过：悬停立刻展开、
+        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一。
+        其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
         m = QMenu()
@@ -9843,13 +10247,24 @@ class PetWindow(QWidget):
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
         m.addSeparator()
-        # 「动作」是快捷菜单里唯一的一条子菜单：目前只有「高兴跳舞」，
+        # 「动作」是快捷菜单里的子菜单之一：目前只有「高兴跳舞」，
         # 以后别的动作也挂在这儿（ACTION_CLIPS 加一行就会自动出现在菜单里）。
         act_menu = m.addMenu("动作")
         for action_name in ACTION_CLIPS:
             act_menu.addAction(
                 action_name,
                 lambda _=False, n=action_name: self.start_action(n))
+        # 「待机模式」：两项互斥、当前模式打勾；状态**打开菜单时现读** cfg，
+        # 点完立即 set_idle_mode（写 config.json），不用重启。
+        idle_menu = m.addMenu("待机模式")
+        idle_group = QActionGroup(m)
+        idle_group.setExclusive(True)
+        for idle_key, idle_label in (("normal", "正常模式"), ("clear", "通透模式")):
+            a = idle_menu.addAction(idle_label)
+            a.setCheckable(True)
+            a.setChecked(self.cfg.get("idle_mode", "normal") == idle_key)
+            idle_group.addAction(a)
+            a.triggered.connect(lambda _=False, k=idle_key: self.set_idle_mode(k))
         m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
