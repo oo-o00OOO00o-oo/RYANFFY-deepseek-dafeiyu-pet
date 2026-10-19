@@ -48,3 +48,9 @@ _shot_*.png
 # ���Ͻ�ͼ
 _dsh_*.png
 
+
+# 通透模式 BGM：音频由使用者自备，不进仓库
+assets/clear_idle/*.ogg
+assets/clear_idle/*.mp3
+assets/clear_idle/*.wav
+assets/clear_idle/*.flac
