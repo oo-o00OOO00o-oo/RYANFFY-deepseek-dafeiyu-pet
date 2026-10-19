@@ -4964,6 +4964,8 @@ class PetWindow(QWidget):
         self._sfx_audio = None
         self._sfx_volume = 0.0
         self._sfx_path = ""
+        self._sfx_loop = False
+        self._sfx_loop_start = 0
         self._migrate_skin_library()      # 老配置里直接存的图片路径 → 搬进「我的形象库」
         self._rebuild_sprites()
         self.icon = QIcon(os.path.join(SPRITE_DIR, "icon.png"))
@@ -8025,6 +8027,8 @@ class PetWindow(QWidget):
         self._sfx_audio = None
         self._sfx_volume = 0.0
         self._sfx_path = ""
+        self._sfx_loop = False
+        self._sfx_loop_start = 0
         if player is not None:
             try:
                 player.stop()
@@ -8047,10 +8051,11 @@ class PetWindow(QWidget):
                 and status == QMediaPlayer.MediaStatus.EndOfMedia):
             self._stop_sfx_media()
 
-    def _play_sfx_media(self, path, start_ms=0, volume=0.8):
+    def _play_sfx_media(self, path, start_ms=0, volume=0.8, loop=False):
         """播一条一次性音轨（跳舞 / 哭）；和通透模式 BGM 完全分开。
 
         `volume` 是相对音量，最终音量 = 设置里的音量 × volume。
+        `loop=True`：播到结尾后回到 `start_ms` 继续（哭的尾段用这个循环）。
         文件不存在 / 解码失败就静默返回 False，不弹窗、不报错。
         """
         self._stop_sfx_media()
@@ -8068,12 +8073,19 @@ class PetWindow(QWidget):
             self._sfx_audio = audio
             self._sfx_volume = factor
             self._sfx_path = path
+            self._sfx_loop = bool(loop)
+            self._sfx_loop_start = int(start_ms) if loop else 0
             seeked = [False]
 
             def on_status(status):
                 if player is not self._sfx_player:
                     return
                 if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                    if self._sfx_loop:
+                        # 尾段循环：回到 3350ms 再播，不经过前面 3.3 秒安静段
+                        player.setPosition(self._sfx_loop_start)
+                        player.play()
+                        return
                     self._on_sfx_media_status(status, player)
                     return
                 # setPosition 在媒体还没 Loaded 时会被吞掉：等第一次 Buffered/Loaded
@@ -8578,9 +8590,16 @@ class PetWindow(QWidget):
                     self._cry_broken = True
             except Exception:
                 self._cry_broken = True
-        if stage == "cry" and not self._cry_broken:
-            # 前 3.3 秒是安静的，从 3350ms 起才是哭声（和最后 16 帧对齐）
-            self._play_sfx_media(SFX_CRY_PATH, SFX_CRY_START_MS)
+        if stage == "grab":
+            # 刚抢走那一下先放开头的一声"哎"（前 3.3 秒里唯一的声音）
+            self._play_sfx_media(SFX_CRY_PATH, 0)
+        elif stage == "cry" and not self._cry_broken:
+            # 前 3.3 秒是安静的，从 3350ms 起才是哭声（和最后 16 帧对齐）；
+            # 尾段循环播，别让"一直哭"变成只有第一遍有声音。
+            self._play_sfx_media(SFX_CRY_PATH, SFX_CRY_START_MS, loop=True)
+        elif stage == "cry":
+            # 哭帧缺失、整段退回「着急」：把抢走时那声"哎"也收掉
+            self._stop_sfx_media()
         lines = COIN_STOLEN_LINES.get(stage) or []
         if lines:
             if stage == "sobj":
