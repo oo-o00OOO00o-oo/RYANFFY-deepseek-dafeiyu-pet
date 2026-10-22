@@ -5187,6 +5187,12 @@ class PetWindow(QWidget):
         self.bubble_until = 0
         self.bubble_inner = False
         self.bubble_card = None        # 问答卡片（有它就不画普通台词气泡）
+        # 表情气泡（右键「发个表情」）：图和 caption 画在同一个气泡区，5 秒自动收。
+        # _meme_path 非空 = 表情正占着气泡区（优先于普通台词气泡）。
+        self._meme_path = None
+        self._meme_caption = ""
+        self._meme_until = 0.0
+        self._meme_pressed = False     # 这一下按在表情上（松手不当单击处理）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -7184,6 +7190,9 @@ class PetWindow(QWidget):
                 self._paint_question_card(p, ink)
             else:
                 self._paint_note_bubble(p, ink)
+        elif mode == "meme":
+            # 表情气泡：图 + 一句话（点一下 / 到点都会收）
+            self._paint_meme_bubble(p, self._bubble_ink())
         elif mode == "balance":
             # 余额气泡：余额 / 今日已用（数字带滚动动画）
             ink = self._bubble_ink()
@@ -7395,6 +7404,73 @@ class PetWindow(QWidget):
             p.drawText(QRectF(bx, by + pad_y + i * line_h, bw, line_h),
                        Qt.AlignmentFlag.AlignCenter, l)
 
+    def _meme_caption_text(self, fm, max_w):
+        """表情配文一行：放不下就用省略号（超长 caption 不能把气泡撑出窗口）。"""
+        return ellipsize(fm, self._meme_caption or "", max(24, max_w))
+
+    def _meme_layout(self):
+        """算表情气泡的排版（布局单独拆出来，回归测试直接量它）。
+
+        返回 dict（pix / cap / bw / bh / bx / by …）；没图 / 坏图返回 None。
+        尺寸：图等比缩到高 ≤ 96、宽 ≤ min(240, 窗口宽-8)，再给 caption 和内边距
+        让位 —— 图片 + caption 总高不超过 BUBBLE_H。
+        """
+        if not self._meme_path:
+            return None
+        f_cap = QFont(self.bubble_font)
+        f_cap.setPointSize(10)
+        f_cap.setWeight(QFont.Weight.Medium)
+        f_cap.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        fm_cap = QFontMetrics(f_cap)
+        cap_h = fm_cap.height()
+        # 气泡本体能用的高度：BUBBLE_H 再给尾巴留 10px（_bubble_top 那套）
+        budget_h = BUBBLE_H - 10
+        inner_max_w = max(24, min(MEME_MAX_W, self.width() - 8) - MEME_PAD * 2)
+        max_img_h = max(8, min(MEME_MAX_H,
+                               budget_h - cap_h - MEME_GAP - MEME_PAD * 2))
+        pix = load_meme_pixmap(self._meme_path, inner_max_w, max_img_h)
+        if pix is None:
+            return None
+        pw, ph = pix.width(), pix.height()
+        cap = self._meme_caption_text(fm_cap, inner_max_w)
+        bw = min(max(pw, fm_cap.horizontalAdvance(cap)) + MEME_PAD * 2,
+                 self.width() - 6)
+        bh = ph + MEME_GAP + cap_h + MEME_PAD * 2
+        return {"pix": pix, "f_cap": f_cap, "fm_cap": fm_cap, "cap": cap,
+                "cap_h": cap_h, "pw": pw, "ph": ph, "bw": bw, "bh": bh,
+                "bx": (self.width() - bw) / 2.0,
+                "by": self._bubble_top(bh + 10)}
+
+    def _paint_meme_bubble(self, p, ink):
+        """表情气泡：星空气泡底 + 居中一张图 + 下面一行 caption。
+
+        尺寸 / 省略号都在 `_meme_layout()` 里算好；这里只管画。
+        """
+        lay = self._meme_layout()
+        if lay is None:
+            return
+        pix, bw, bh, bx, by = (lay["pix"], lay["bw"], lay["bh"],
+                               lay["bx"], lay["by"])
+        rect = QRectF(bx, by, bw, bh)
+        path = bubble_path(rect, 14, self.width() / 2.0, 9)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink["shadow"])
+        p.save()
+        p.translate(0, 2)
+        p.drawPath(path)
+        p.restore()
+        self._paint_bubble_body(p, path, rect, ink)
+        # 图居中（透明通道靠 drawPixmap 原样带过去）
+        ix = bx + (bw - lay["pw"]) / 2.0
+        iy = by + MEME_PAD
+        p.drawPixmap(QRectF(ix, iy, lay["pw"], lay["ph"]), pix,
+                     QRectF(0, 0, pix.width(), pix.height()))
+        p.setFont(lay["f_cap"])
+        p.setPen(ink["fg"])
+        p.drawText(QRectF(bx + MEME_PAD, iy + lay["ph"] + MEME_GAP,
+                          bw - MEME_PAD * 2, lay["cap_h"]),
+                   Qt.AlignmentFlag.AlignCenter, lay["cap"])
+
     def _paint_question_card(self, p, ink):
         """DSH 提问卡片：标题 + 题面 + 选项胶囊 + 右下角"点我去回答"。
 
@@ -7501,12 +7577,18 @@ class PetWindow(QWidget):
         return self.t * self.tick_ms / 1000.0
 
     def _bubble_mode(self, now):
-        """气泡区这会儿该显示什么：text（说话）/ balance（余额）/ lyric（歌词）。
+        """气泡区这会儿该显示什么：meme（表情）/ text（说话）/ balance（余额）/ lyric（歌词）。
 
+        表情优先于普通台词：同一块区域，表情挂着的这几秒先画表情，
+        表情一收（到点 / 点一下）文字气泡自己回来（bubble_until 还留着）。
         放歌时歌词优先于「余额常显」——想瞄一眼余额就快速双击（显示 5 秒）。
         """
+        self._expire_meme(now)          # 到点就自己收
+        if self._meme_path is not None:
+            return "meme"
         if self._clear_lyrics_only():
             # 通透模式只放歌词：余额 / 外部歌词 / 问答卡片都不进气泡
+            # （表情是用户自己点的，不在这条限制里——见 show_meme）
             if self.bubble_text and now < self.bubble_until:
                 return "text"
             return None
@@ -9929,6 +10011,16 @@ class PetWindow(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            # 表情挂着头顶时点一下 = 立刻收（不蹦、不响，也不算单击/双击）
+            if self.meme_active():
+                self._meme_pressed = True
+                self.clear_meme()
+                self._last_click_ms = -99999
+                self._single_pending = None
+                self.last_press_pos = None
+                self.drag_start_pos = None
+                return
+            self._meme_pressed = False
             # 点在歌词气泡那几颗 ⏮ / ⏸▶ / ⏭ 上：不进"蹦一下 + 响一声"那套，
             # 等松手再看点的是哪一颗（切歌 / 切播放暂停）
             kind = self._lyric_btn_kind(e.position())
@@ -9973,6 +10065,11 @@ class PetWindow(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._meme_pressed:
+            # 刚才那一下按在表情上：只收表情，不当成单击（不蹦也不说话）
+            self._meme_pressed = False
+            self._press_on_lyric_btn = None
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             pressed = getattr(self, "_press_on_lyric_btn", None)
             if pressed:
