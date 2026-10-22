@@ -3411,7 +3411,10 @@ CHAT_COMMON_RULES = "\n".join([
     "- 不用排版、不用列表，不要输出 markdown / 代码块",
     "- 不要自称 AI / 模型 / 助手，也不要解释自己有系统提示",
 ])
-CHAT_REPLY_DISPLAY_MAX = 110         # 头顶气泡塞得下的上限；超出的在历史里保留全文
+CHAT_REPLY_DISPLAY_MAX = 180         # 头顶气泡塞得下的上限；超出的在历史里保留全文
+CHAT_BUBBLE_H = 240                  # 聊天时气泡区临时加高（窗口往上长，精灵不动）
+CHAT_FONT_PT = 11.5                  # 聊天用大字（不再为了塞字数缩到 8 磅）
+CHAT_MAX_LINES = 10
 CHAT_HISTORY_ROUNDS = 6              # 只带最近 6 轮
 CHAT_HISTORY_MAX = CHAT_HISTORY_ROUNDS * 2
 CHAT_TYPE_CPS = 40.0                 # 打字机：约 40 字/秒
@@ -6256,6 +6259,8 @@ class PetWindow(QWidget):
         # 老配置里存的是无级调节调出来的高度（不在五档上）时，得把那个高度的精灵补上，
         # 否则第一帧就没图可画
         self._ensure_sprites(self.cur_h)
+        # 气泡区高度：平时就是 BUBBLE_H；聊天回复长的时候临时加高（窗口往上长，精灵不动）
+        self.bubble_h = BUBBLE_H
         self._apply_window_size()
         # 上次选的通透模式，这次启动时素材却不在（目录改名 / 删帧）：
         # 先退回正常模式，不读盘、不弹窗；用户下次点菜单还会重试。
@@ -8416,7 +8421,7 @@ class PetWindow(QWidget):
             ph = pix.height() * scale * (1 + act_sy) * press_sy
             pw = pix.width() * scale * (1 + act_sx) * press_sx
             dx = cx - pw / 2
-            bottom = BUBBLE_H + MARGIN + self.cur_h
+            bottom = self.bubble_h + MARGIN + self.cur_h
             dy = bottom - ph + jump + bob
             p.save()
             p.setOpacity(opacity)
@@ -8440,7 +8445,7 @@ class PetWindow(QWidget):
 
     def _bubble_top(self, bh):
         """气泡贴着鱼头顶：尾巴尖落在精灵上沿附近。"""
-        return max(2.0, BUBBLE_H + MARGIN - 10 - bh)
+        return max(2.0, self.bubble_h + MARGIN - 10 - bh)
 
     # ---------- 气泡外观（2026-10-17 重画：圆角 + 投影 + 细描边 + 小尾巴） ----------
     def _make_bubble_font(self):
@@ -8560,7 +8565,7 @@ class PetWindow(QWidget):
         fm_cap = QFontMetrics(f_cap)
         cap_h = fm_cap.height()
         # 气泡本体能用的高度：BUBBLE_H 再给尾巴留 10px（_bubble_top 那套）
-        budget_h = BUBBLE_H - 10
+        budget_h = self.bubble_h - 10
         inner_max_w = max(24, min(MEME_MAX_W, self.width() - 8) - MEME_PAD * 2)
         max_img_h = max(8, min(MEME_MAX_H,
                                budget_h - cap_h - MEME_GAP - MEME_PAD * 2))
@@ -8638,7 +8643,7 @@ class PetWindow(QWidget):
                          (inner_w - foot_w - 6) if foot_fits else inner_w)
         line_h = fm_q.height() + 1
         chip_h = fm_o.height() + 3
-        limit = BUBBLE_H - 2.0
+        limit = self.bubble_h - 2.0
         all_q = self._wrap_cjk(fm_q, text, inner_w)
         plan = None
         for n_q, n_o in ((4, 3), (3, 3), (3, 2), (2, 2), (2, 1)):
@@ -9697,7 +9702,7 @@ class PetWindow(QWidget):
         spec_w = getattr(self, "_spec_w", 0) or int(self.cur_h * 0.93)
         dir_ = getattr(self, "dir", "down")
         three = self._rice_three_view()
-        sprite_bottom = self.y() + BUBBLE_H + MARGIN + self.cur_h
+        sprite_bottom = self.y() + self.bubble_h + MARGIN + self.cur_h
         sprite_cx = self.x() + self.width() * 0.5
 
         offset_x = 0.0
@@ -11278,6 +11283,24 @@ class PetWindow(QWidget):
         now_ms = self.t * self.tick_ms
         self.rest_until = max(getattr(self, "rest_until", 0), now_ms + int(ms))
 
+    def _set_bubble_h(self, height):
+        """聊天时把气泡区临时加高：窗口往上长，精灵底边留在原处（不让她往下跳）。"""
+        h = int(max(BUBBLE_H, min(int(height), BUBBLE_H + 180)))
+        if int(getattr(self, "bubble_h", BUBBLE_H)) == h:
+            return
+        old_bottom = self.y() + self.bubble_h + MARGIN + self.cur_h
+        self.bubble_h = h
+        self._apply_window_size()
+        if self.isVisible():
+            new_y = int(old_bottom - (self.bubble_h + MARGIN + self.cur_h))
+            try:
+                geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+                new_y = max(geo.top(), min(geo.bottom() - self.height() + 1, new_y))
+            except Exception:
+                pass
+            self.move(self.x(), new_y)
+        self.update()
+
     def _chat_show_text(self, text, seconds):
         """直接把一句话放进气泡（不走 say() 的通透模式拦截：聊天是用户自己点的）。"""
         now = self._secs()
@@ -11342,6 +11365,7 @@ class PetWindow(QWidget):
             self._chat_started = True
             self._chat_full = ""
             self._chat_reveal_n = 0.0
+            self._set_bubble_h(CHAT_BUBBLE_H)     # 聊天用大气泡（窗口往上长）
         self._chat_full += piece
         self._chat_typing = True
         # 游标不动：模型一次吐一大段也只按 40 字/秒慢慢冒（真·打字机）
@@ -11349,7 +11373,7 @@ class PetWindow(QWidget):
         self.update()
 
     def _chat_fit_display(self, text):
-        """把回复裁/缩到头顶气泡放得下：字号 10.5 → 8，最多 6 行。
+        """把回复裁到加高后的气泡里：固定 11.5 磅、最多 10 行，不再缩成小字。
 
         返回 (显示文本, 字号)。历史里仍保留完整回复。
         """
@@ -11358,22 +11382,19 @@ class PetWindow(QWidget):
             return "", None
         if len(text) > CHAT_REPLY_DISPLAY_MAX:
             text = text[:CHAT_REPLY_DISPLAY_MAX - 1].rstrip() + "…"
+        f = QFont(self.bubble_font)
+        f.setPointSizeF(CHAT_FONT_PT)
+        fm = QFontMetrics(f)
         max_w = min(248, self.width() - 10) - 26
-        for pt in (10.5, 10.0, 9.5, 9.0, 8.5, 8.0):
-            f = QFont(self.bubble_font)
-            f.setPointSizeF(pt)
-            fm = QFontMetrics(f)
-            if len(self._wrap_cjk(fm, text, max_w)) <= 6:
-                return text, pt
-            if pt <= 8.0:
-                prefix = ""
-                for ch in text:
-                    trial = prefix + ch
-                    if len(self._wrap_cjk(fm, trial, max_w)) > 6:
-                        break
-                    prefix = trial
-                return prefix.rstrip() + "…", pt
-        return text, 8.0
+        if len(self._wrap_cjk(fm, text, max_w)) <= CHAT_MAX_LINES:
+            return text, CHAT_FONT_PT
+        prefix = ""
+        for ch in text:
+            trial = prefix + ch
+            if len(self._wrap_cjk(fm, trial, max_w)) > CHAT_MAX_LINES:
+                break
+            prefix = trial
+        return prefix.rstrip() + "…", CHAT_FONT_PT
 
     def _chat_on_done(self, user_text):
         self._chat_busy = False
@@ -11405,6 +11426,7 @@ class PetWindow(QWidget):
         self._chat_busy = False
         self._chat_typing = False
         self._chat_reset_state()
+        self._set_bubble_h(BUBBLE_H)
         self._chat_show_text(CHAT_FALLBACK_LINE, CHAT_HOLD_SEC + 1.0)
 
     def _chat_on_disconnect(self):
@@ -11454,6 +11476,7 @@ class PetWindow(QWidget):
         if shown and self.bubble_text == shown:
             self.bubble_text = ""
         self._chat_reset_state()
+        self._set_bubble_h(BUBBLE_H)
         self.update()
 
     # ---------- 鼠标事件 ----------
@@ -14401,7 +14424,7 @@ class PetWindow(QWidget):
         self._spec_w = spec_w          # 白饭碗定位要用（身前有多远）
         self.win_mx = int(self.cur_h * 0.062) + 6
         self.win_w = max(spec_w + self.win_mx * 2, MIN_WIN_W)
-        self.setFixedSize(self.win_w, self.cur_h + BUBBLE_H + MARGIN * 2 + 10)
+        self.setFixedSize(self.win_w, self.cur_h + self.bubble_h + MARGIN * 2 + 10)
         if getattr(self, "_rice", None) is not None:      # 白饭碗跟着档位缩放
             self._rice.apply_size(self.cur_h)
 
