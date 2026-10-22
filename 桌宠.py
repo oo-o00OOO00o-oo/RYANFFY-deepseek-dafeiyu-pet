@@ -3407,10 +3407,11 @@ CHAT_PERSONAS = {
 CHAT_PERSONA_DEFAULT = "温柔"
 CHAT_COMMON_RULES = "\n".join([
     "- 只用简体中文回答",
-    "- 1~2 句、不超过 40 字，像在桌面上随口说话",
-    "- 不要输出 markdown、代码块、列表",
+    "- 按你的性格自然地说，长短随内容需要，像在桌面上随口说话",
+    "- 不用排版、不用列表，不要输出 markdown / 代码块",
     "- 不要自称 AI / 模型 / 助手，也不要解释自己有系统提示",
 ])
+CHAT_REPLY_DISPLAY_MAX = 110         # 头顶气泡塞得下的上限；超出的在历史里保留全文
 CHAT_HISTORY_ROUNDS = 6              # 只带最近 6 轮
 CHAT_HISTORY_MAX = CHAT_HISTORY_ROUNDS * 2
 CHAT_TYPE_CPS = 40.0                 # 打字机：约 40 字/秒
@@ -4764,8 +4765,9 @@ def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
 CHAT_PANEL_W = 360
 CHAT_PANEL_H = 104
 CHAT_DRAWER_H = 320
-CHAT_ROW_Y = 36
-CHAT_ROW_H = 32
+CHAT_ROW_Y = 20
+CHAT_INPUT_H = 62
+CHAT_ROW_H = 34
 CHAT_RADIUS = 16
 MEME_GRID_COLS = 5
 MEME_CELL = 62
@@ -4780,11 +4782,16 @@ _PANEL_CELL_BG = QColor(14, 16, 38, 205)
 _PANEL_CELL_HOVER = QColor(150, 168, 248, 190)
 
 _CHAT_INPUT_QSS = (
-    "QLineEdit { background: rgba(8, 10, 28, 120);"
+    "QLineEdit, QTextEdit { background: rgba(8, 10, 28, 120);"
     " border: 1px solid rgba(150, 168, 248, 60); border-radius: 9px;"
     " color: #E8ECFF; padding-left: 8px; padding-right: 8px;"
     " selection-background-color: #46558f; }"
-    "QLineEdit:focus { border: 1px solid rgba(150, 168, 248, 150); }")
+    "QLineEdit:focus, QTextEdit:focus { border: 1px solid rgba(150, 168, 248, 150); }"
+    "QTextEdit QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }"
+    "QTextEdit QScrollBar::handle:vertical { background: rgba(150, 168, 248, 90);"
+    " border-radius: 2px; min-height: 18px; }"
+    "QTextEdit QScrollBar::add-line:vertical, QTextEdit QScrollBar::sub-line:vertical"
+    " { height: 0; }")
 _CHAT_BTN_QSS = (
     "QToolButton { background: rgba(255, 255, 255, 14);"
     " border: 1px solid rgba(150, 168, 248, 65); border-radius: 9px;"
@@ -5180,12 +5187,11 @@ class ChatPanel(QWidget):
         self._persona.setStyleSheet("background: transparent; color: #A8B0D2;")
         self._persona.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        self._input = QLineEdit(self)
+        self._input = ChatInput(self)
         self._input.setPlaceholderText("跟小鲸鱼娘说点什么…")
-        self._input.setClearButtonEnabled(False)
         self._input.setStyleSheet(_CHAT_INPUT_QSS)
-        self._input.returnPressed.connect(self._send)
-        self._input.installEventFilter(self)
+        self._input.sendRequested.connect(self._send)
+        self._input.escapePressed.connect(self._handle_escape)
 
         self._meme_btn = QToolButton(self)
         self._meme_btn.setText("")
@@ -5318,13 +5324,13 @@ class ChatPanel(QWidget):
 
     def _relayout(self):
         w = self.width()
-        self._close_btn.setGeometry(w - 30, 6, 22, 22)
-        self._persona.setGeometry(14, CHAT_ROW_Y + 7, 42, 18)
+        self._close_btn.setGeometry(w - 30, 4, 22, 22)
+        self._persona.setGeometry(14, CHAT_ROW_Y + 22, 42, 18)
         emoji_x = w - 10 - 44 - 6 - 30
-        self._meme_btn.setGeometry(emoji_x, CHAT_ROW_Y, 30, CHAT_ROW_H)
-        self._send_btn.setGeometry(w - 10 - 44, CHAT_ROW_Y, 44, CHAT_ROW_H)
+        self._meme_btn.setGeometry(emoji_x, CHAT_ROW_Y + 14, 30, CHAT_ROW_H)
+        self._send_btn.setGeometry(w - 10 - 44, CHAT_ROW_Y + 14, 44, CHAT_ROW_H)
         self._input.setGeometry(60, CHAT_ROW_Y, max(60, emoji_x - 6 - 60),
-                                CHAT_ROW_H)
+                                CHAT_INPUT_H)
         search_y = CHAT_PANEL_H + 10
         self._search.setGeometry(10, search_y, 196, 28)
         self._filter_btn.setGeometry(212, search_y, 72, 28)
@@ -5510,7 +5516,7 @@ class ChatPanel(QWidget):
 
     # ---------- 发送 / 点表情 ----------
     def _send(self):
-        text = self._input.text().strip()
+        text = self._input.toPlainText().strip()
         if not text:
             return
         self._input.clear()
@@ -6315,7 +6321,11 @@ class PetWindow(QWidget):
         self._chat_started = False        # 第一段文本到了没（到之前先显示"嗯…我想想"）
         self._chat_typing = False         # 打字机还在跑
         self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
+        self._chat_font_pt = None         # 长回复自动缩字号（让气泡不压到身上）
         self._chat_panel = None           # 星空聊天面板（打开时创建，非模态）
+        # 表情斗图：主人发一张 → 过一会儿她回一张
+        self._meme_reply_timer = None
+        self._meme_reply_tag = ""
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -8499,6 +8509,9 @@ class PetWindow(QWidget):
         """普通台词气泡：柔和投影 + 细描边 + 圆角小尾巴，行距比原来松一点。"""
         inner = self.bubble_inner
         f_main, _f_small, _f_tag = self._bubble_fonts(10.5)
+        if self._chat_font_pt and self._chat_full and self.bubble_text:
+            # 聊天回复可能比较长：按 _chat_fit_display() 选好的字号画，气泡不压到身上
+            f_main.setPointSizeF(float(self._chat_font_pt))
         if inner:
             f_main.setItalic(True)
         fg = ink["inner_fg"] if inner else ink["fg"]
@@ -11256,6 +11269,7 @@ class PetWindow(QWidget):
         self._chat_reveal_n = 0.0
         self._chat_started = False
         self._chat_typing = False
+        self._chat_font_pt = None
 
     def _freeze_for_chat(self, ms):
         """聊天期间站住不动（rest_until 用的是内部毫秒时钟）。"""
@@ -11334,6 +11348,33 @@ class PetWindow(QWidget):
         self.bubble_until = max(float(self.bubble_until or 0.0), self._secs() + 2.0)
         self.update()
 
+    def _chat_fit_display(self, text):
+        """把回复裁/缩到头顶气泡放得下：字号 10.5 → 8，最多 6 行。
+
+        返回 (显示文本, 字号)。历史里仍保留完整回复。
+        """
+        text = str(text or "")
+        if not text:
+            return "", None
+        if len(text) > CHAT_REPLY_DISPLAY_MAX:
+            text = text[:CHAT_REPLY_DISPLAY_MAX - 1].rstrip() + "…"
+        max_w = min(248, self.width() - 10) - 26
+        for pt in (10.5, 10.0, 9.5, 9.0, 8.5, 8.0):
+            f = QFont(self.bubble_font)
+            f.setPointSizeF(pt)
+            fm = QFontMetrics(f)
+            if len(self._wrap_cjk(fm, text, max_w)) <= 6:
+                return text, pt
+            if pt <= 8.0:
+                prefix = ""
+                for ch in text:
+                    trial = prefix + ch
+                    if len(self._wrap_cjk(fm, trial, max_w)) > 6:
+                        break
+                    prefix = trial
+                return prefix.rstrip() + "…", pt
+        return text, 8.0
+
     def _chat_on_done(self, user_text):
         self._chat_busy = False
         full = self._chat_full.strip()
@@ -11343,12 +11384,20 @@ class PetWindow(QWidget):
         self._chat_history.append({"role": "user", "content": str(user_text)})
         self._chat_history.append({"role": "assistant", "content": full})
         del self._chat_history[:-CHAT_HISTORY_MAX]     # 只留最近 6 轮
+        # 头顶气泡塞不下太长的回复：只裁显示（必要时缩字号），历史里留全文
+        display, display_pt = self._chat_fit_display(full)
+        self._chat_font_pt = display_pt
+        if display != self._chat_full:
+            self._chat_full = display
+            self._chat_reveal_n = min(self._chat_reveal_n, float(len(display)))
+            self.bubble_text = display[:max(1, int(self._chat_reveal_n))]
         remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
         self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
         self._trigger_until = max(float(self._trigger_until or 0.0),
                                   self.bubble_until)
         self._freeze_for_chat(int((remain + CHAT_HOLD_SEC) * 1000))
-        chat_debug("完成：%d 字，历史 %d 条" % (len(full), len(self._chat_history)))
+        chat_debug("完成：%d 字（显示 %d），历史 %d 条"
+                   % (len(full), len(self._chat_full), len(self._chat_history)))
 
     def _chat_on_error(self, reason):
         """连不上 / 非 200 / 解析失败：气泡里给兜底台词，日志记 WARN，不弹异常框。"""
@@ -11366,8 +11415,11 @@ class PetWindow(QWidget):
             self._chat_on_error("流式断开且没有收到内容")
             return
         self._chat_full = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
+        self._chat_full, self._chat_font_pt = self._chat_fit_display(self._chat_full)
         self._chat_typing = True
         self._chat_started = True
+        if self._chat_reveal_n > len(self._chat_full):
+            self._chat_reveal_n = float(len(self._chat_full))
         remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
         self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
         self.update()
