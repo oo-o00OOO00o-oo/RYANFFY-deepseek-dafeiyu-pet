@@ -24,6 +24,7 @@ import threading
 import time
 import wave
 from array import array
+from collections import OrderedDict
 from datetime import datetime
 
 def load_config():
@@ -37,18 +38,19 @@ def load_config():
         }
 
 import requests
-from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice,
+from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QUrl, QIODevice,
                             QEventLoop, QSize, QFileInfo, QEvent, QAbstractNativeEventFilter,
-                            QObject)
+                            QObject, Signal)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
-                           QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence, QPen,
-                           QPainterPath, QLinearGradient, QActionGroup)
+                           QPolygonF, QImage, QImageReader, QCursor, QMouseEvent,
+                           QKeySequence, QPen, QPalette, QPainterPath,
+                           QLinearGradient, QActionGroup)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
                                QSlider, QWidgetAction, QFileDialog, QListWidget,
                                QListWidgetItem, QLabel, QFileIconProvider, QSizePolicy,
-                               QComboBox)
+                               QComboBox, QScrollArea)
 
 try:
     from PySide6.QtMultimedia import QSoundEffect
@@ -4744,6 +4746,663 @@ def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
     return pm
 
 
+# ---------- 聊天面板 + 表情抽屉 ----------
+# 面板是无边框置顶小窗：星空底 + 一行输入；点 😊 往下展开一块表情网格（5 列）。
+# 网格只在 paintEvent 里解码"可见 + 上下各预取 1 行"的缩略图，缓存 LRU 80 张 ——
+# 434 张图一次性解码会卡住界面好几秒，这条是硬约束。
+CHAT_PANEL_W = 360
+CHAT_PANEL_H = 104
+CHAT_DRAWER_H = 320
+CHAT_ROW_Y = 36
+CHAT_ROW_H = 32
+CHAT_RADIUS = 16
+MEME_GRID_COLS = 5
+MEME_CELL = 62
+MEME_GRID_GAP = 6
+MEME_GRID_LIMIT = 200            # 一次最多渲染 200 个格子（再多也没人翻）
+MEME_THUMB_CACHE_MAX = 80        # 缩略图 LRU 上限
+MEME_GRID_W = MEME_GRID_COLS * MEME_CELL + (MEME_GRID_COLS - 1) * MEME_GRID_GAP
+
+_PANEL_FG = QColor(232, 236, 255)
+_PANEL_DIM = QColor(168, 176, 210)
+_PANEL_CELL_BG = QColor(14, 16, 38, 205)
+_PANEL_CELL_HOVER = QColor(150, 168, 248, 190)
+
+_CHAT_INPUT_QSS = (
+    "QLineEdit { background: rgba(8, 10, 28, 120);"
+    " border: 1px solid rgba(150, 168, 248, 60); border-radius: 9px;"
+    " color: #E8ECFF; padding-left: 8px; padding-right: 8px;"
+    " selection-background-color: #46558f; }"
+    "QLineEdit:focus { border: 1px solid rgba(150, 168, 248, 150); }")
+_CHAT_BTN_QSS = (
+    "QToolButton { background: rgba(255, 255, 255, 14);"
+    " border: 1px solid rgba(150, 168, 248, 65); border-radius: 9px;"
+    " color: #E8ECFF; padding: 0px; }"
+    "QToolButton:hover { background: rgba(150, 168, 248, 60); }"
+    "QToolButton:pressed { background: rgba(150, 168, 248, 100); }")
+_CHAT_SEND_QSS = (
+    "QToolButton { background: rgba(92, 112, 205, 175);"
+    " border: 1px solid rgba(150, 168, 248, 120); border-radius: 9px;"
+    " color: #F2F5FF; padding: 0px; }"
+    "QToolButton:hover { background: rgba(120, 142, 235, 210); }"
+    "QToolButton:pressed { background: rgba(150, 168, 248, 160); }")
+_CHAT_SCROLL_QSS = (
+    "QScrollArea { background: transparent; border: none; }"
+    "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+    "QScrollBar::handle:vertical { background: rgba(150, 168, 248, 90);"
+    " border-radius: 3px; min-height: 28px; }"
+    "QScrollBar::handle:vertical:hover { background: rgba(150, 168, 248, 150); }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }")
+
+
+def smiley_pixmap(size=22):
+    """画一个 😊 当表情键的图标（不依赖 Segoe UI Emoji 有没有装 / 能不能彩色渲染）。"""
+    pm = QPixmap(int(size), int(size))
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(255, 206, 84))
+    p.drawEllipse(1, 1, int(size) - 2, int(size) - 2)
+    p.setBrush(QColor(58, 44, 22))
+    r = max(1.2, size * 0.085)
+    p.drawEllipse(QPointF(size * 0.34, size * 0.40), r, r)
+    p.drawEllipse(QPointF(size * 0.66, size * 0.40), r, r)
+    pen = QPen(QColor(58, 44, 22), max(1.4, size * 0.075))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawArc(QRectF(size * 0.26, size * 0.42, size * 0.48, size * 0.36),
+              200 * 16, 140 * 16)
+    p.end()
+    return pm
+
+
+class MemeThumbCache:
+    """表情缩略图缓存：按需解码 + LRU 80 张。
+
+    `loads` / `hits` 是给回归测试看的计数（真实解码 vs 缓存命中）。
+    """
+
+    def __init__(self, limit=MEME_THUMB_CACHE_MAX):
+        self.limit = max(1, int(limit))
+        self._data = OrderedDict()
+        self.loads = 0
+        self.hits = 0
+
+    def get(self, path, size=MEME_CELL):
+        key = (str(path), int(size))
+        if key in self._data:
+            self._data.move_to_end(key)
+            self.hits += 1
+            return self._data[key]
+        pm = self._decode(path, int(size))
+        self.loads += 1
+        self._data[key] = pm
+        while len(self._data) > self.limit:
+            self._data.popitem(last=False)        # 最久没用到的先淘汰
+        return pm
+
+    @staticmethod
+    def _decode(path, size):
+        """解码成"填满 size×size"的 cover 缩略图（等比放大后居中裁掉多余部分）。"""
+        try:
+            reader = QImageReader(str(path))
+            reader.setAutoTransform(True)
+            src = reader.size()
+            if src.isValid() and src.width() > 0 and src.height() > 0:
+                # 先算目标尺寸再让 reader 只解这么多像素，比读完原图再缩快得多
+                scale = max(size / float(src.width()), size / float(src.height()))
+                reader.setScaledSize(QSize(max(1, round(src.width() * scale)),
+                                           max(1, round(src.height() * scale))))
+                img = reader.read()
+            else:
+                img = QImage(str(path))
+            if img.isNull():
+                return None
+            pm = QPixmap.fromImage(img)
+            if pm.isNull():
+                return None
+            x = max(0, (pm.width() - size) // 2)
+            y = max(0, (pm.height() - size) // 2)
+            return pm.copy(x, y, min(size, pm.width()), min(size, pm.height()))
+        except Exception:
+            return None
+
+
+class MemeGrid(QWidget):
+    """5 列表情格子。只画可见区域（上下各预取 1 行），点格子发 cellClicked(序号)。"""
+
+    cellClicked = Signal(int)
+
+    def __init__(self, thumbs, parent=None):
+        super().__init__(parent)
+        self._thumbs = thumbs
+        self._items = []
+        self._viewport = None
+        self._hover = -1
+        self.setMouseTracking(True)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setFixedWidth(MEME_GRID_W)
+        f = QFont(self.font())
+        f.setPointSize(9)
+        self.setFont(f)
+
+    def set_items(self, items):
+        self._items = list(items or [])
+        self._hover = -1
+        rows = (len(self._items) + MEME_GRID_COLS - 1) // MEME_GRID_COLS
+        h = rows * MEME_CELL + max(0, rows - 1) * MEME_GRID_GAP
+        self.setFixedHeight(max(0, h))
+        self.update()
+
+    def items(self):
+        return list(self._items)
+
+    def set_viewport(self, widget):
+        self._viewport = widget
+
+    def cell_rect(self, index):
+        row, col = divmod(int(index), MEME_GRID_COLS)
+        x = col * (MEME_CELL + MEME_GRID_GAP)
+        y = row * (MEME_CELL + MEME_GRID_GAP)
+        return QRect(x, y, MEME_CELL, MEME_CELL)
+
+    def index_at(self, pos):
+        x, y = int(pos.x()), int(pos.y())
+        if x < 0 or y < 0:
+            return -1
+        step = MEME_CELL + MEME_GRID_GAP
+        col, row = x // step, y // step
+        if col >= MEME_GRID_COLS:
+            return -1
+        if x - col * step >= MEME_CELL or y - row * step >= MEME_CELL:
+            return -1
+        idx = row * MEME_GRID_COLS + col
+        return idx if idx < len(self._items) else -1
+
+    def _visible_range(self):
+        """返回要画的序号闭区间（可见行 ±1 行预取）。"""
+        if not self._items:
+            return 0, -1
+        if self._viewport is not None:
+            try:
+                origin = self.mapFrom(self._viewport, QPoint(0, 0))
+                vis = QRect(origin, self._viewport.size()).intersected(self.rect())
+            except Exception:
+                vis = self.rect()
+        else:
+            vis = self.rect()
+        if vis.isEmpty():
+            return 0, -1
+        step = MEME_CELL + MEME_GRID_GAP
+        rows = (len(self._items) + MEME_GRID_COLS - 1) // MEME_GRID_COLS
+        first = max(0, vis.top() // step - 1)
+        last = min(rows - 1, vis.bottom() // step + 1)
+        return (first * MEME_GRID_COLS,
+                min(len(self._items) - 1, last * MEME_GRID_COLS + MEME_GRID_COLS - 1))
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        start, end = self._visible_range()
+        clip = ev.rect()
+        for idx in range(start, end + 1):
+            rect = self.cell_rect(idx)
+            if not rect.intersects(clip):
+                continue
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(rect), 8, 8)
+            p.save()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.fillPath(path, _PANEL_CELL_BG)
+            pm = self._thumbs.get(self._items[idx][0], MEME_CELL)
+            if pm is not None and not pm.isNull():
+                p.setClipPath(path)
+                dx = rect.x() + (rect.width() - pm.width()) // 2
+                dy = rect.y() + (rect.height() - pm.height()) // 2
+                p.drawPixmap(dx, dy, pm)
+            else:
+                p.setPen(_PANEL_DIM)
+                p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "?")
+            p.restore()
+            if idx == self._hover:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_PANEL_CELL_HOVER, 2))
+                p.drawPath(path)
+        p.end()
+
+    def mouseMoveEvent(self, ev):
+        idx = self.index_at(ev.position().toPoint())
+        if idx != self._hover:
+            self._hover = idx
+            self.update()
+        super().mouseMoveEvent(ev)
+
+    def leaveEvent(self, ev):
+        if self._hover != -1:
+            self._hover = -1
+            self.update()
+        super().leaveEvent(ev)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            idx = self.index_at(ev.position().toPoint())
+            if idx >= 0:
+                self.cellClicked.emit(idx)
+                return
+        super().mousePressEvent(ev)
+
+
+class ChatPanel(QWidget):
+    """星空风聊天面板：一行输入 + 😊 展开的表情抽屉（非模态，不阻塞主循环）。"""
+
+    def __init__(self, pet):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.Tool
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.pet = pet
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("聊天")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFixedWidth(CHAT_PANEL_W)
+        self._drawer_open = False
+        self._tag = ""
+        self._filtered = []
+        self._shown = []
+        self._guard = None
+        self._thumbs = MemeThumbCache()
+        self._last_pos = None
+        self._persona_cache = ""
+        self._font_sig = None
+        self._build_ui()
+        self.resize(CHAT_PANEL_W, CHAT_PANEL_H)
+        self._relayout()
+
+    # ---------- 界面 ----------
+    def _build_ui(self):
+        self._persona = QLabel("温柔", self)
+        self._persona.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._persona.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self._input = QLineEdit(self)
+        self._input.setPlaceholderText("跟小鲸鱼娘说点什么…")
+        self._input.setClearButtonEnabled(False)
+        self._input.setStyleSheet(_CHAT_INPUT_QSS)
+        self._input.returnPressed.connect(self._send)
+        self._input.installEventFilter(self)
+
+        self._meme_btn = QToolButton(self)
+        self._meme_btn.setText("")
+        self._meme_btn.setIcon(QIcon(smiley_pixmap(22)))
+        self._meme_btn.setIconSize(QSize(22, 22))
+        self._meme_btn.setToolTip("表情")
+        self._meme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._meme_btn.clicked.connect(self.toggle_drawer)
+
+        self._send_btn = QToolButton(self)
+        self._send_btn.setText("发送")
+        self._send_btn.setToolTip("发送（Enter）")
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setStyleSheet(_CHAT_SEND_QSS)
+        self._send_btn.clicked.connect(self._send)
+
+        self._close_btn = QToolButton(self)
+        self._close_btn.setText("×")
+        self._close_btn.setToolTip("关闭（Esc）")
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.clicked.connect(self.close_panel)
+
+        # 表情抽屉
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("搜索描述 / 关键词…")
+        self._search.setStyleSheet(_CHAT_INPUT_QSS)
+        self._search.installEventFilter(self)
+        self._search.textChanged.connect(self._on_search_changed)
+
+        self._filter_btn = QToolButton(self)
+        self._filter_btn.setText("筛选 ▾")
+        self._filter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter_btn.clicked.connect(self._show_filter_menu)
+        self._filter_actions = {}
+        self._filter_menu = QMenu(self)
+        group = QActionGroup(self._filter_menu)
+        group.setExclusive(True)
+        for tag, label in (("", "全部"),) + tuple(MEME_TAGS):
+            act = self._filter_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(tag == "")
+            act.triggered.connect(lambda _=False, t=tag: self._set_tag(t))
+            group.addAction(act)
+            self._filter_actions[tag] = act
+
+        self._count = QLabel("共 0 张", self)
+        self._count.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._count.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setStyleSheet(_CHAT_SCROLL_QSS)
+        self._scroll.viewport().setAutoFillBackground(False)
+
+        self._grid = MemeGrid(self._thumbs)
+        self._grid.set_viewport(self._scroll.viewport())
+        self._grid.cellClicked.connect(self._on_cell_clicked)
+        self._grid_holder = QWidget()
+        self._grid_holder.setAutoFillBackground(False)
+        self._grid_holder.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        holder_lay = QVBoxLayout(self._grid_holder)
+        holder_lay.setContentsMargins(0, 0, 0, 0)
+        holder_lay.setSpacing(0)
+        holder_lay.addWidget(self._grid, 0, Qt.AlignmentFlag.AlignHCenter)
+        holder_lay.addStretch(1)
+        self._scroll.setWidget(self._grid_holder)
+        self._footer_visible = False
+
+        self._footer = QLabel("", self)
+        self._footer.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._footer.setWordWrap(True)
+        self._footer.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self._empty_label = QLabel("没找到这类表情", self)
+        self._empty_label.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_btn = QPushButton("清空筛选", self)
+        self._empty_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._empty_btn.setStyleSheet(
+            "QPushButton { background: rgba(150, 168, 248, 55);"
+            " border: 1px solid rgba(150, 168, 248, 100); border-radius: 8px;"
+            " color: #E8ECFF; padding: 4px 10px; }"
+            "QPushButton:hover { background: rgba(150, 168, 248, 95); }")
+        self._empty_btn.clicked.connect(self._clear_filters)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._refresh)
+
+        # placeholder 在深色底上要亮一点（QSS 的 color 管不到 placeholder）
+        for edit in (self._input, self._search):
+            pal = edit.palette()
+            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(168, 176, 210, 175))
+            edit.setPalette(pal)
+
+        # 抽屉关着时先把这些收起来
+        for w in self._drawer_widgets():
+            w.hide()
+
+    def _drawer_widgets(self):
+        return (self._search, self._filter_btn, self._count, self._scroll,
+                self._footer, self._empty_label, self._empty_btn)
+
+    def _apply_fonts(self):
+        base = QFont(self.pet.bubble_font) if getattr(self.pet, "bubble_font", None) \
+            else QFont()
+        base.setPointSize(11)
+        self._input.setFont(base)
+        f_small = QFont(base)
+        f_small.setPointSizeF(9.0)
+        self._persona.setFont(f_small)
+        f_search = QFont(base)
+        f_search.setPointSizeF(9.5)
+        self._search.setFont(f_search)
+        f_btn = QFont(f_small)
+        for b in (self._filter_btn, self._send_btn, self._close_btn):
+            b.setFont(f_btn)
+        self._count.setFont(f_small)
+        self._footer.setFont(f_small)
+        self._empty_label.setFont(f_small)
+        self._empty_btn.setFont(f_small)
+        f_close = QFont(f_small)
+        f_close.setPointSizeF(13.0)
+        self._close_btn.setFont(f_close)
+
+    def _relayout(self):
+        w = self.width()
+        self._close_btn.setGeometry(w - 30, 6, 22, 22)
+        self._persona.setGeometry(14, CHAT_ROW_Y + 7, 42, 18)
+        emoji_x = w - 10 - 44 - 6 - 30
+        self._meme_btn.setGeometry(emoji_x, CHAT_ROW_Y, 30, CHAT_ROW_H)
+        self._send_btn.setGeometry(w - 10 - 44, CHAT_ROW_Y, 44, CHAT_ROW_H)
+        self._input.setGeometry(60, CHAT_ROW_Y, max(60, emoji_x - 6 - 60),
+                                CHAT_ROW_H)
+        search_y = CHAT_PANEL_H + 10
+        self._search.setGeometry(10, search_y, 196, 28)
+        self._filter_btn.setGeometry(212, search_y, 72, 28)
+        self._count.setGeometry(290, search_y, 60, 28)
+        scroll_y = search_y + 36
+        footer_visible = bool(self._footer_visible)
+        scroll_h = CHAT_PANEL_H + CHAT_DRAWER_H - 10 - scroll_y
+        if footer_visible:
+            scroll_h -= 22
+        self._scroll.setGeometry(10, scroll_y, 340, scroll_h)
+        self._footer.setGeometry(10, scroll_y + scroll_h + 2, 340, 18)
+        self._empty_label.setGeometry(10, scroll_y + 70, 340, 24)
+        self._empty_btn.setGeometry(10 + 124, scroll_y + 108, 92, 30)
+
+    def _apply_height(self):
+        h = CHAT_PANEL_H + (CHAT_DRAWER_H if self._drawer_open else 0)
+        self.resize(CHAT_PANEL_W, h)
+        self._relayout()
+        if self.isVisible():
+            self._place(keep_top=True)
+
+    # ---------- 开关 / 跟随 ----------
+    def refresh_persona(self):
+        name = self.pet.chat_persona_name()
+        font_sig = str(getattr(self.pet, "bubble_font_key", ""))
+        if name != self._persona_cache:
+            self._persona_cache = name
+            self._persona.setText(name)
+        if font_sig != self._font_sig:
+            self._font_sig = font_sig
+            self._apply_fonts()
+
+    def show_panel(self):
+        self.refresh_persona()
+        if self._guard is None:
+            self._guard = self.pet._ui_guard()
+            self._guard.__enter__()
+        if not self.isVisible():
+            self._apply_height()
+            self._place(keep_top=False)
+            self.show()
+        else:
+            self._apply_height()
+        if self._drawer_open:
+            self._refresh()
+            self._search.setFocus()
+        else:
+            self._input.setFocus()
+        self.raise_()
+        self.activateWindow()
+        self.update()
+
+    def close_panel(self):
+        self._search_timer.stop()
+        if self.isVisible():
+            self.hide()
+        self._release_guard()
+
+    def _release_guard(self):
+        guard, self._guard = self._guard, None
+        if guard is not None:
+            try:
+                guard.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    def toggle_drawer(self):
+        self._drawer_open = not self._drawer_open
+        if self._drawer_open:
+            self._search.show()
+            self._filter_btn.show()
+            self._count.show()
+            self._refresh()
+            self._search.setFocus()
+        else:
+            for w in self._drawer_widgets():
+                w.hide()
+            self._input.setFocus()
+        self._apply_height()
+
+    def follow_pet(self):
+        if self.isVisible():
+            self._place(keep_top=False)
+
+    def tick_follow(self):
+        """主循环每帧调一次：跟着桌宠走 / 桌宠藏了就收起来 / 性格换了就更新名字。"""
+        if not self.isVisible():
+            return
+        if not self.pet.isVisible():
+            self.close_panel()
+            return
+        self.refresh_persona()
+        self._place(keep_top=False)
+
+    def _place(self, keep_top=False):
+        pet = self.pet
+        try:
+            screen = pet.screen() or QApplication.primaryScreen()
+            geo = screen.availableGeometry()
+        except Exception:
+            return
+        w, h = self.width(), self.height()
+        if keep_top:
+            x, y = self.x(), self.y()
+        else:
+            x = pet.x() + pet.width() // 2 - w // 2
+            y = pet.y() - h - 6
+            if y < geo.top():
+                y = pet.y() + pet.height() + 6
+        x = max(geo.left(), min(geo.right() - w + 1, x))
+        y = max(geo.top(), min(geo.bottom() - h + 1, y))
+        if (x, y) != (self.x(), self.y()):
+            self.move(int(x), int(y))
+        self._last_pos = (pet.x(), pet.y())
+
+    # ---------- 搜索 / 筛选 ----------
+    def _on_search_changed(self, _text):
+        self._search_timer.start()
+
+    def _show_filter_menu(self):
+        self._filter_menu.popup(self._filter_btn.mapToGlobal(
+            QPoint(0, self._filter_btn.height() + 2)))
+
+    def _set_tag(self, tag):
+        self._tag = tag or ""
+        for t, act in self._filter_actions.items():
+            act.setChecked(t == self._tag)
+        self._refresh()
+
+    def _clear_filters(self):
+        self._search.blockSignals(True)
+        self._search.clear()
+        self._search.blockSignals(False)
+        self._search_timer.stop()
+        self._tag = ""
+        for t, act in self._filter_actions.items():
+            act.setChecked(t == "")
+        self._refresh()
+
+    def _refresh(self):
+        """按（tag + 关键词）过滤内存里的索引；一次最多交给网格 200 张。"""
+        try:
+            items = _meme_items()
+        except Exception:
+            items = []
+        tag = self._tag
+        needle = self._search.text().strip().lower()
+        matched = []
+        for item in items:
+            if tag and item[1] != tag:
+                continue
+            if needle:
+                hay = (item[2] + " " + item[3]).lower()
+                if needle not in hay:
+                    continue
+            matched.append(item)
+        self._filtered = matched
+        total = len(matched)
+        self._shown = matched[:MEME_GRID_LIMIT]
+        self._grid.set_items(self._shown)
+        self._count.setText("共 %d 张" % total)
+        extra = total - len(self._shown)
+        self._footer_visible = extra > 0
+        if self._footer_visible:
+            self._footer.setText(
+                "只画了前 %d 张，还有 %d 张 —— 用搜索或筛选取一部分"
+                % (len(self._shown), extra))
+        self._footer.setVisible(self._footer_visible)
+        empty = total == 0
+        self._scroll.setVisible(not empty)
+        self._empty_label.setVisible(empty)
+        self._empty_btn.setVisible(empty)
+        self._relayout()
+
+    # ---------- 发送 / 点表情 ----------
+    def _send(self):
+        text = self._input.text().strip()
+        if not text:
+            return
+        self._input.clear()
+        self.pet.send_chat(text)
+        self._input.setFocus()
+
+    def _on_cell_clicked(self, index):
+        if 0 <= index < len(self._shown):
+            path, _tag, caption, _keywords = self._shown[index]
+            # 只在桌面上显示，不进聊天历史、不污染 LLM 上下文
+            self.pet.show_meme_path(path, caption)
+
+    # ---------- 键盘 ----------
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            if self._drawer_open:
+                self.toggle_drawer()
+                self._input.setFocus()
+            else:
+                self.close_panel()
+            return
+        super().keyPressEvent(ev)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+            self.keyPressEvent(ev)
+            return True
+        if obj is self._search and ev.type() == QEvent.Type.KeyPress \
+                and ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._search_timer.stop()
+            self._refresh()
+            return True
+        return super().eventFilter(obj, ev)
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, CHAT_RADIUS, CHAT_RADIUS)
+        paint_starry_bubble(p, path, rect)
+        p.end()
+
+    def resizeEvent(self, ev):
+        self._relayout()
+        super().resizeEvent(ev)
+
+    def closeEvent(self, ev):
+        self._search_timer.stop()
+        self._release_guard()
+        super().closeEvent(ev)
+
+
 def wrap_text(fm, text, max_w):
     """按像素宽度折行：中文逐字折，英文整词折（别把单词劈两半）。"""
     lines, cur = [], ""
@@ -5491,6 +6150,7 @@ class PetWindow(QWidget):
         self._chat_started = False        # 第一段文本到了没（到之前先显示"嗯…我想想"）
         self._chat_typing = False         # 打字机还在跑
         self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
+        self._chat_panel = None           # 星空聊天面板（打开时创建，非模态）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -9348,6 +10008,8 @@ class PetWindow(QWidget):
 
     def tick(self):
         self.t += 1
+        if self._chat_panel is not None:
+            self._chat_panel.tick_follow()   # 面板跟着桌宠走 / 她藏了就收起来
         self._chat_tick()          # 聊天：收后台结果 + 打字机（各移动模式都要走）
         self._tick_clear_music()   # 通透模式 BGM + 歌词
         self._rice_tick()          # 白饭碗：拖着追 / 不拖抱着
@@ -10309,24 +10971,22 @@ class PetWindow(QWidget):
         self.say("好，我换成「%s」的性格啦" % name, seconds=2.2, again=True)
 
     def open_chat_dialog(self):
-        """右键「聊天…」：弹输入框（沿用仓库现有的 QInputDialog 风格）。
+        """右键「聊天…」：开星空聊天面板（原来的 QInputDialog 已经换掉）。
 
-        Enter 发送、Esc 取消都是 Qt 对话框自带的行为；这期间桌宠站住不动。
+        名字保留是为了不动右键菜单那条 action；真正的窗口是 ChatPanel。
         """
-        persona = self.chat_persona_name()
-        with self._ui_guard():
-            text, ok = QInputDialog.getText(
-                self,
-                "聊天（%s）" % persona,
-                "想跟小鲸鱼娘说什么？（Enter 发送，Esc 取消）",
-                QLineEdit.EchoMode.Normal,
-                "",
-                Qt.WindowType.WindowStaysOnTopHint)
-        if not ok:
-            return
-        text = (text or "").strip()
-        if text:
-            self.send_chat(text)
+        self.open_chat_panel()
+
+    def open_chat_panel(self):
+        """打开 / 置前聊天面板（非模态，不阻塞主循环）。"""
+        if self._chat_panel is None:
+            self._chat_panel = ChatPanel(self)
+        self._chat_panel.show_panel()
+        return self._chat_panel
+
+    def close_chat_panel(self):
+        if self._chat_panel is not None:
+            self._chat_panel.close_panel()
 
     def send_chat(self, user_text):
         """发一条：先取消上一条，再开后台线程流式请求（UI 线程立刻返回）。"""
@@ -13587,6 +14247,7 @@ class PetWindow(QWidget):
 
     def toggle_visible(self):
         if self.isVisible():
+            self.close_chat_panel()
             self.hide()
             if getattr(self, "_rice", None) is not None:
                 self._rice.hide()
@@ -13601,6 +14262,7 @@ class PetWindow(QWidget):
                 self._rice_carry_update(snap=True)
 
     def quit_app(self):
+        self.close_chat_panel()
         self._unregister_hotkeys()        # 全局快捷键要还给系统，不然退出后这个键就废了
         self._stop_sfx_media()
         self._pause_clear_music()
