@@ -4577,7 +4577,7 @@ MEME_SECONDS = 5.0       # 表情在头顶挂多久
 MEME_GAP = 4             # 图片和 caption 之间的间距
 MEME_PAD = 5             # 表情气泡的内边距
 
-# 索引缓存：{"root": 上次扫的根目录, "items": [(绝对路径, tag, caption), ...]}
+# 索引缓存：{"root": 上次扫的根目录, "items": [(绝对路径, tag, caption, keywords), ...]}
 # 一个进程只扫一次；根目录被换掉（测试 monkeypatch MEME_ROOT）才会重扫。
 _meme_index_cache = {"root": None, "items": None}
 # 缩放缓存：{(路径, 目标宽, 目标高): QPixmap 或 False}。每帧都要画，
@@ -4644,22 +4644,29 @@ def _scan_meme_packs(root):
         except sqlite3.Error:
             continue
         try:
-            rows = con.execute("SELECT path, tag, caption FROM memes").fetchall()
+            rows = con.execute(
+                "SELECT path, tag, caption, keywords FROM memes").fetchall()
         except sqlite3.Error:
-            rows = []
+            # 很老的包可能没有 keywords 列：退回去读三列，搜索就只搜 caption
+            try:
+                rows = [(p, t, c, "") for p, t, c in con.execute(
+                    "SELECT path, tag, caption FROM memes").fetchall()]
+            except sqlite3.Error:
+                rows = []
         finally:
             try:
                 con.close()
             except sqlite3.Error:
                 pass
-        for rel, tag, caption in rows:
+        for rel, tag, caption, keywords in rows:
             abs_path = _meme_abs_inside(root, pack, rel)
             if abs_path is None:
                 continue
             # 索引里可能留着已经被删掉的图（用户手动清理过）：扫的时候就跳过
             if not os.path.isfile(abs_path):
                 continue
-            items.append((abs_path, (tag or "").strip(), (caption or "").strip()))
+            items.append((abs_path, (tag or "").strip(), (caption or "").strip(),
+                          (keywords or "").strip()))
     return items
 
 
@@ -4689,7 +4696,7 @@ def pick_meme(tag=None):
         same_tag = [it for it in usable if it[1] == tag] if tag else []
         pool = same_tag or usable
         if pool:
-            abs_path, _tag, caption = random.choice(pool)
+            abs_path, _tag, caption, _keywords = random.choice(pool)
             return abs_path, caption
     return None
 
