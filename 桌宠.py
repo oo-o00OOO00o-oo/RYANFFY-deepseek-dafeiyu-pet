@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
                                QSlider, QWidgetAction, QFileDialog, QListWidget,
                                QListWidgetItem, QLabel, QFileIconProvider, QSizePolicy,
-                               QComboBox, QScrollArea)
+                               QComboBox, QScrollArea, QTextEdit)
 
 try:
     from PySide6.QtMultimedia import QSoundEffect
@@ -4871,8 +4871,85 @@ class MemeThumbCache:
             return None
 
 
+class MemeCell(QWidget):
+    """池里的一个格子：滚动时循环复用，只有内容真的换了才重绘 / 换图。"""
+
+    def __init__(self, grid, parent=None):
+        super().__init__(parent)
+        self.grid = grid
+        self._index = -1
+        self._path = None
+        self._pm = None
+        self._hover = False
+        self.content_changes = 0        # 内容真换了几次（回归测试用）
+        self.setFixedSize(MEME_CELL, MEME_CELL)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+
+    def set_item(self, index, item):
+        self._index = int(index)
+        path = item[0]
+        if path != self._path:
+            # 只有换了图才重新取缩略图 / update；滚动一行时大部分格子停在同一张
+            self._path = path
+            self._pm = self.grid.thumbs.get(path, MEME_CELL)
+            self.content_changes += 1
+            self.update()
+
+    def clear_item(self):
+        if self._index != -1 or self._path is not None:
+            self._index = -1
+            self._path = None
+            self._pm = None
+            self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        rect = QRectF(self.rect())
+        path = QPainterPath()
+        path.addRoundedRect(rect, 8, 8)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.fillPath(path, _PANEL_CELL_BG)
+        if self._pm is not None and not self._pm.isNull():
+            p.setClipPath(path)
+            dx = (self.width() - self._pm.width()) // 2
+            dy = (self.height() - self._pm.height()) // 2
+            p.drawPixmap(dx, dy, self._pm)
+        else:
+            p.setPen(_PANEL_DIM)
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "?")
+        if self._hover:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_PANEL_CELL_HOVER, 2))
+            p.drawPath(path)
+        p.end()
+
+    def enterEvent(self, ev):
+        self._hover = True
+        self.update()                   # 只重绘这一格，不动整个网格
+        super().enterEvent(ev)
+
+    def leaveEvent(self, ev):
+        self._hover = False
+        self.update()
+        super().leaveEvent(ev)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._index >= 0:
+            self.grid._cell_clicked(self._index)
+            return
+        super().mousePressEvent(ev)
+
+
 class MemeGrid(QWidget):
-    """5 列表情格子。只画可见区域（上下各预取 1 行），点格子发 cellClicked(序号)。"""
+    """固定格子池的 5 列网格：控件数由视口大小决定，滚动时循环复用。
+
+    池子大小 = 5 列 ×（可见行数 + 2 行缓冲）。滚出屏幕的格子不销毁，
+    改装新露出来的那一行；同一格内容没变就不换图、不重绘。
+    """
 
     cellClicked = Signal(int)
 
@@ -4881,22 +4958,28 @@ class MemeGrid(QWidget):
         self._thumbs = thumbs
         self._items = []
         self._viewport = None
-        self._hover = -1
-        self.setMouseTracking(True)
+        self._pool = []
+        self._pool_rows = 0
+        self._cells = {}               # 当前可见：index -> MemeCell
+        self.setFixedWidth(MEME_GRID_W)
         self.setAutoFillBackground(False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setFixedWidth(MEME_GRID_W)
-        f = QFont(self.font())
-        f.setPointSize(9)
-        self.setFont(f)
+
+    @property
+    def thumbs(self):
+        return self._thumbs
 
     def set_items(self, items):
         self._items = list(items or [])
-        self._hover = -1
         rows = (len(self._items) + MEME_GRID_COLS - 1) // MEME_GRID_COLS
         h = rows * MEME_CELL + max(0, rows - 1) * MEME_GRID_GAP
         self.setFixedHeight(max(0, h))
-        self.update()
+        # 筛选/搜索变了：整页内容都换了，池子里的内容全部作废
+        for cell in self._pool:
+            cell.clear_item()
+            cell.hide()
+        self._cells = {}
+        self.sync_pool()
 
     def items(self):
         return list(self._items)
@@ -4909,6 +4992,10 @@ class MemeGrid(QWidget):
         x = col * (MEME_CELL + MEME_GRID_GAP)
         y = row * (MEME_CELL + MEME_GRID_GAP)
         return QRect(x, y, MEME_CELL, MEME_CELL)
+
+    def cell_widget(self, index):
+        """当前可见的格子控件（测试 / 调试用；不可见返回 None）。"""
+        return self._cells.get(int(index))
 
     def index_at(self, pos):
         x, y = int(pos.x()), int(pos.y())
@@ -4923,78 +5010,132 @@ class MemeGrid(QWidget):
         idx = row * MEME_GRID_COLS + col
         return idx if idx < len(self._items) else -1
 
-    def _visible_range(self):
-        """返回要画的序号闭区间（可见行 ±1 行预取）。"""
-        if not self._items:
-            return 0, -1
+    def _viewport_rect(self):
         if self._viewport is not None:
             try:
                 origin = self.mapFrom(self._viewport, QPoint(0, 0))
-                vis = QRect(origin, self._viewport.size()).intersected(self.rect())
+                return QRect(origin, self._viewport.size()).intersected(self.rect())
             except Exception:
-                vis = self.rect()
-        else:
-            vis = self.rect()
-        if vis.isEmpty():
-            return 0, -1
+                return self.rect()
+        return self.rect()
+
+    def _row_span(self):
+        vis = self._viewport_rect()
         step = MEME_CELL + MEME_GRID_GAP
         rows = (len(self._items) + MEME_GRID_COLS - 1) // MEME_GRID_COLS
-        first = max(0, vis.top() // step - 1)
-        last = min(rows - 1, vis.bottom() // step + 1)
+        if vis.isEmpty() or rows <= 0:
+            return 0, -1, 0, -1, rows
+        first_vis = max(0, vis.top() // step)
+        last_vis = min(rows - 1, vis.bottom() // step)
+        first = max(0, first_vis - 1)          # 上面多备 1 行
+        last = min(rows - 1, last_vis + 1)     # 下面多备 1 行
+        return first_vis, last_vis, first, last, rows
+
+    def _pool_row_count(self):
+        """池子行数 = 视口能放下的行数 + 2 行缓冲（由窗口大小决定）。"""
+        vis = self._viewport_rect()
+        step = MEME_CELL + MEME_GRID_GAP
+        if vis.isEmpty() or vis.height() <= 0:
+            return 6
+        rows = int(math.ceil(vis.height() / float(step)))
+        return max(2, min(12, rows)) + 2
+
+    def _ensure_pool(self):
+        need = MEME_GRID_COLS * self._pool_row_count()
+        if len(self._pool) == need:
+            return
+        for cell in self._pool:
+            cell.hide()
+            cell.deleteLater()
+        self._pool = [MemeCell(self, self) for _ in range(need)]
+        for cell in self._pool:
+            cell.hide()
+        self._cells = {}
+        self._pool_rows = need // MEME_GRID_COLS
+
+    def _visible_range(self):
+        """要绑定的序号闭区间（可见行 ±1 行缓冲）。"""
+        _fv, _lv, first, last, _rows = self._row_span()
+        if last < first:
+            return 0, -1
         return (first * MEME_GRID_COLS,
                 min(len(self._items) - 1, last * MEME_GRID_COLS + MEME_GRID_COLS - 1))
 
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        start, end = self._visible_range()
-        clip = ev.rect()
-        for idx in range(start, end + 1):
-            rect = self.cell_rect(idx)
-            if not rect.intersects(clip):
-                continue
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(rect), 8, 8)
-            p.save()
-            p.setPen(Qt.PenStyle.NoPen)
-            p.fillPath(path, _PANEL_CELL_BG)
-            pm = self._thumbs.get(self._items[idx][0], MEME_CELL)
-            if pm is not None and not pm.isNull():
-                p.setClipPath(path)
-                dx = rect.x() + (rect.width() - pm.width()) // 2
-                dy = rect.y() + (rect.height() - pm.height()) // 2
-                p.drawPixmap(dx, dy, pm)
+    def sync_pool(self):
+        """把可见（含缓冲）的格子绑到池子里的控件上；没变的不碰。"""
+        if not self._items:
+            for cell in self._pool:
+                cell.clear_item()
+                cell.hide()
+            self._cells = {}
+            return
+        vis = self._viewport_rect()
+        if vis.isEmpty():
+            return
+        self._ensure_pool()
+        _fv, _lv, first, last, _rows = self._row_span()
+        if last < first:
+            return
+        bound = set()
+        new_cells = {}
+        for row in range(first, last + 1):
+            for col in range(MEME_GRID_COLS):
+                idx = row * MEME_GRID_COLS + col
+                if idx >= len(self._items):
+                    continue
+                slot = (row % self._pool_rows) * MEME_GRID_COLS + col
+                cell = self._pool[slot]
+                if cell._index != idx:
+                    cell.set_item(idx, self._items[idx])
+                rect = self.cell_rect(idx)
+                if cell.geometry() != rect:
+                    cell.setGeometry(rect)
+                if not cell.isVisible():
+                    cell.show()
+                bound.add(id(cell))
+                new_cells[idx] = cell
+        for cell in self._pool:
+            if id(cell) not in bound:
+                cell.clear_item()
+                cell.hide()
+        self._cells = new_cells
+
+    def resizeEvent(self, ev):
+        self.sync_pool()
+        super().resizeEvent(ev)
+
+    def showEvent(self, ev):
+        self.sync_pool()
+        super().showEvent(ev)
+
+    def _cell_clicked(self, index):
+        self.cellClicked.emit(int(index))
+
+class ChatInput(QTextEdit):
+    """多行输入框：Enter 发送、Shift+Enter 换行、Esc 交给面板处理。"""
+
+    sendRequested = Signal()
+    escapePressed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+        self.setTabChangesFocus(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(ev)      # Shift+Enter：正常换行
             else:
-                p.setPen(_PANEL_DIM)
-                p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "?")
-            p.restore()
-            if idx == self._hover:
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(_PANEL_CELL_HOVER, 2))
-                p.drawPath(path)
-        p.end()
-
-    def mouseMoveEvent(self, ev):
-        idx = self.index_at(ev.position().toPoint())
-        if idx != self._hover:
-            self._hover = idx
-            self.update()
-        super().mouseMoveEvent(ev)
-
-    def leaveEvent(self, ev):
-        if self._hover != -1:
-            self._hover = -1
-            self.update()
-        super().leaveEvent(ev)
-
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            idx = self.index_at(ev.position().toPoint())
-            if idx >= 0:
-                self.cellClicked.emit(idx)
-                return
-        super().mousePressEvent(ev)
+                self.sendRequested.emit()       # Enter：发送
+            return
+        if ev.key() == Qt.Key.Key_Escape:
+            self.escapePressed.emit()
+            return
+        super().keyPressEvent(ev)
 
 
 class ChatPanel(QWidget):
@@ -5090,6 +5231,7 @@ class ChatPanel(QWidget):
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setStyleSheet(_CHAT_SCROLL_QSS)
         self._scroll.viewport().setAutoFillBackground(False)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._sync_grid_pool)
 
         self._grid = MemeGrid(self._thumbs)
         self._grid.set_viewport(self._scroll.viewport())
@@ -5185,6 +5327,8 @@ class ChatPanel(QWidget):
         self._footer.setGeometry(10, scroll_y + scroll_h + 2, 340, 18)
         self._empty_label.setGeometry(10, scroll_y + 70, 340, 24)
         self._empty_btn.setGeometry(10 + 124, scroll_y + 108, 92, 30)
+        if getattr(self, "_grid", None) is not None:
+            self._grid.sync_pool()
 
     def _apply_height(self):
         h = CHAT_PANEL_H + (CHAT_DRAWER_H if self._drawer_open else 0)
@@ -5192,6 +5336,8 @@ class ChatPanel(QWidget):
         self._relayout()
         if self.isVisible():
             self._place(keep_top=True)
+        if getattr(self, "_grid", None) is not None:
+            QTimer.singleShot(0, self._grid.sync_pool)
 
     # ---------- 开关 / 跟随 ----------
     def refresh_persona(self):
@@ -5290,6 +5436,11 @@ class ChatPanel(QWidget):
     # ---------- 搜索 / 筛选 ----------
     def _on_search_changed(self, _text):
         self._search_timer.start()
+
+    def _sync_grid_pool(self, *_args):
+        grid = getattr(self, "_grid", None)
+        if grid is not None:
+            grid.sync_pool()
 
     def _show_filter_menu(self):
         self._filter_menu.popup(self._filter_btn.mapToGlobal(
