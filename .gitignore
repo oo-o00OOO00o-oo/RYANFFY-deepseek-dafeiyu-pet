@@ -54,3 +54,4 @@ assets/clear_idle/*.ogg
 assets/clear_idle/*.mp3
 assets/clear_idle/*.wav
 assets/clear_idle/*.flac
+chat-debug.log
