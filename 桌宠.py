@@ -5155,11 +5155,20 @@ class PetWindow(QWidget):
             "console_card_radius": 12,
             "console_remember_geo": True,
             "console_geo": "",
-            "console_start_page": "balance"
+            "console_start_page": "balance",
+            # 本地 LLM 聊天（右键「聊天…」）：provider 全部配置化，业务代码不写死
+            # base_url / 模型名；环境变量 BIGFISH_LLM_* 可以临时覆盖。
+            "llm_provider": DEFAULT_LLM_PROVIDER,
+            "llm_providers": merge_llm_providers(None),
+            "chat_persona": CHAT_PERSONA_DEFAULT,
         }
         self.cfg = load_json(CONFIG_PATH, dict(cfg_defaults))
         for cfg_key, cfg_value in cfg_defaults.items():
             self.cfg.setdefault(cfg_key, cfg_value)
+        # 老配置里的 llm_providers 可能只有一条 / 缺字段：按默认表补齐（云端那条保留）
+        self.cfg["llm_providers"] = merge_llm_providers(self.cfg.get("llm_providers"))
+        if self.cfg.get("chat_persona") not in CHAT_PERSONAS:
+            self.cfg["chat_persona"] = CHAT_PERSONA_DEFAULT
         # 老配置里没有 idle_mode / 存了别的值：一律当正常模式，别让脏值传到下面
         if self.cfg.get("idle_mode") not in ("normal", "clear"):
             self.cfg["idle_mode"] = "normal"
@@ -5283,6 +5292,16 @@ class PetWindow(QWidget):
         self.bubble_until = 0
         self.bubble_inner = False
         self.bubble_card = None        # 问答卡片（有它就不画普通台词气泡）
+        # 本地 LLM 聊天（右键「聊天…」）：后台线程流式取，主线程 tick 里堆字。
+        self._chat_history = []           # 最近 6 轮（12 条），只在内存里，重启清空
+        self._chat_queue = queue.Queue()  # 后台线程 → 主线程：(gen, kind, payload)
+        self._chat_gen = 0                # 每次发送 +1：旧线程的排队结果直接丢掉
+        self._chat_cancel = None          # 当前请求的取消 Event
+        self._chat_full = ""              # 完整回复（打字机按它逐字显示）
+        self._chat_reveal_n = 0.0         # 已经显示到第几个字（浮点，按 tick 累加）
+        self._chat_started = False        # 第一段文本到了没（到之前先显示"嗯…我想想"）
+        self._chat_typing = False         # 打字机还在跑
+        self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -9064,6 +9083,7 @@ class PetWindow(QWidget):
 
     def tick(self):
         self.t += 1
+        self._chat_tick()          # 聊天：收后台结果 + 打字机（各移动模式都要走）
         self._tick_clear_music()   # 通透模式 BGM + 歌词
         self._rice_tick()          # 白饭碗：拖着追 / 不拖抱着
         self._dsh_bar_tick()       # DSH 状态条：贴脚下 / 收后台结果 / 自愈
@@ -9699,6 +9719,9 @@ class PetWindow(QWidget):
             self._set_dir("down", 1)
 
     def _maybe_idle_action(self):
+        # 聊天中（等回复 / 打字机还在冒字）：别乱动、别冒闲话，把气泡让给聊天
+        if self._chat_busy or self._chat_typing or self._chat_full:
+            return
         # 闲着时的"小动作"概率固定 0.03；发呆时说什么、说多勤由主人选的「语录频率」决定
         # （安静 / 正常 / 话多 / 话痨，见 LINE_FREQ_LEVELS）
         preset = LINE_FREQ_LEVELS.get(getattr(self, "line_freq", LINE_FREQ_DEFAULT),
@@ -9959,6 +9982,229 @@ class PetWindow(QWidget):
         busy = max([now, getattr(self, "_trigger_until", 0.0)]
                    + [item[0] for item in self._pending_bubbles])
         return busy + 0.3 if busy > now + 0.01 else None
+
+    # ---------- 本地 LLM 聊天（右键「聊天…」） ----------
+    def chat_persona_name(self):
+        """现在用的是哪个性格（配置里写坏了就回默认，绝不 KeyError）。"""
+        name = str(self.cfg.get("chat_persona") or "")
+        return name if name in CHAT_PERSONAS else CHAT_PERSONA_DEFAULT
+
+    def set_chat_persona(self, name):
+        """右键「性格」里点了一项：写进 config.json，下一条消息生效（历史不动）。"""
+        if name not in CHAT_PERSONAS:
+            return
+        self.cfg["chat_persona"] = name
+        self.save_config()
+        self.say("好，我换成「%s」的性格啦" % name, seconds=2.2, again=True)
+
+    def open_chat_dialog(self):
+        """右键「聊天…」：弹输入框（沿用仓库现有的 QInputDialog 风格）。
+
+        Enter 发送、Esc 取消都是 Qt 对话框自带的行为；这期间桌宠站住不动。
+        """
+        persona = self.chat_persona_name()
+        with self._ui_guard():
+            text, ok = QInputDialog.getText(
+                self,
+                "聊天（%s）" % persona,
+                "想跟小鲸鱼娘说什么？（Enter 发送，Esc 取消）",
+                QLineEdit.EchoMode.Normal,
+                "",
+                Qt.WindowType.WindowStaysOnTopHint)
+        if not ok:
+            return
+        text = (text or "").strip()
+        if text:
+            self.send_chat(text)
+
+    def send_chat(self, user_text):
+        """发一条：先取消上一条，再开后台线程流式请求（UI 线程立刻返回）。"""
+        text = str(user_text or "").strip()
+        if not text:
+            return False
+        self._chat_cancel_previous()
+        self._chat_gen += 1
+        gen = self._chat_gen
+        cancel = threading.Event()
+        self._chat_cancel = cancel
+        self._chat_reset_state()
+        self._chat_busy = True
+        self._freeze_for_chat(8000)
+        provider = llm_provider_config(self.cfg)
+        history = list(self._chat_history)[-CHAT_HISTORY_MAX:]
+        messages = build_chat_messages(self.chat_persona_name(), history, text)
+        # 先占住气泡（等模型那几秒也有话说）
+        self._chat_show_text(CHAT_THINKING_LINE, 60.0)
+        chat_debug("发送：provider=%s model=%s persona=%s 历史=%d 条"
+                   % (provider.get("name"), provider.get("model"),
+                      self.chat_persona_name(), len(history)))
+        threading.Thread(
+            target=self._chat_worker,
+            args=(gen, provider, messages, cancel, text),
+            daemon=True).start()
+        return True
+
+    def _chat_cancel_previous(self):
+        """把上一条的读取循环叫停（它的排队结果会按 gen 丢掉）。"""
+        if self._chat_cancel is not None:
+            try:
+                self._chat_cancel.set()
+            except Exception:
+                pass
+        self._chat_cancel = None
+
+    def _chat_reset_state(self):
+        self._chat_full = ""
+        self._chat_reveal_n = 0.0
+        self._chat_started = False
+        self._chat_typing = False
+
+    def _freeze_for_chat(self, ms):
+        """聊天期间站住不动（rest_until 用的是内部毫秒时钟）。"""
+        self.target = None
+        self.cur_speed = 0.0
+        now_ms = self.t * self.tick_ms
+        self.rest_until = max(getattr(self, "rest_until", 0), now_ms + int(ms))
+
+    def _chat_show_text(self, text, seconds):
+        """直接把一句话放进气泡（不走 say() 的通透模式拦截：聊天是用户自己点的）。"""
+        now = self._secs()
+        self.bubble_card = None
+        self.bubble_inner = False
+        self.bubble_text = text
+        self.bubble_until = now + float(seconds)
+        self._trigger_until = max(float(getattr(self, "_trigger_until", 0.0)),
+                                  now + float(seconds))
+        self.last_line = text
+        self.update()
+
+    def _chat_worker(self, gen, provider, messages, cancel, user_text):
+        """后台线程：只做 HTTP + 解析，结果一律丢回队列，绝不碰 Qt 控件。"""
+        q = self._chat_queue
+        try:
+            for piece in stream_chat_completion(provider, messages, cancel):
+                if cancel.is_set():
+                    return
+                q.put((gen, "chunk", piece))
+            if cancel.is_set():
+                return
+            q.put((gen, "done", user_text))
+        except ChatCancelled:
+            return
+        except ChatDisconnected:
+            q.put((gen, "disconnect", ""))
+        except ChatError as exc:
+            q.put((gen, "error", str(exc)))
+        except Exception as exc:                      # 保险：任何异常都别带崩线程
+            q.put((gen, "error", "%s: %s" % (exc.__class__.__name__, exc)))
+
+    def _chat_tick(self):
+        """每帧：先收后台结果，再推进打字机（放在 tick 最前面，各移动模式都生效）。"""
+        self._chat_drain()
+        self._chat_type_tick()
+
+    def _chat_drain(self):
+        """把后台线程的排队结果在主线程处理掉（非阻塞）。"""
+        while True:
+            try:
+                gen, kind, payload = self._chat_queue.get_nowait()
+            except queue.Empty:
+                break
+            if gen != self._chat_gen:
+                continue                    # 上一条的尾巴：丢了
+            if kind == "chunk":
+                self._chat_on_chunk(payload)
+            elif kind == "done":
+                self._chat_on_done(payload)
+            elif kind == "disconnect":
+                self._chat_on_disconnect()
+            else:
+                self._chat_on_error(payload or "未知错误")
+
+    def _chat_on_chunk(self, piece):
+        piece = str(piece or "")
+        if not piece:
+            return
+        if not self._chat_started:
+            # 第一段到了：把"嗯…我想想"换成真回复，从第 1 个字开始冒
+            self._chat_started = True
+            self._chat_full = ""
+            self._chat_reveal_n = 0.0
+        self._chat_full += piece
+        self._chat_typing = True
+        # 游标不动：模型一次吐一大段也只按 40 字/秒慢慢冒（真·打字机）
+        self.bubble_until = max(float(self.bubble_until or 0.0), self._secs() + 2.0)
+        self.update()
+
+    def _chat_on_done(self, user_text):
+        self._chat_busy = False
+        full = self._chat_full.strip()
+        if not full:
+            self._chat_on_error("模型返回了空内容")
+            return
+        self._chat_history.append({"role": "user", "content": str(user_text)})
+        self._chat_history.append({"role": "assistant", "content": full})
+        del self._chat_history[:-CHAT_HISTORY_MAX]     # 只留最近 6 轮
+        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
+        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
+        self._trigger_until = max(float(self._trigger_until or 0.0),
+                                  self.bubble_until)
+        self._freeze_for_chat(int((remain + CHAT_HOLD_SEC) * 1000))
+        chat_debug("完成：%d 字，历史 %d 条" % (len(full), len(self._chat_history)))
+
+    def _chat_on_error(self, reason):
+        """连不上 / 非 200 / 解析失败：气泡里给兜底台词，日志记 WARN，不弹异常框。"""
+        chat_debug("聊天失败：%s" % reason, "WARN")
+        self._chat_busy = False
+        self._chat_typing = False
+        self._chat_reset_state()
+        self._chat_show_text(CHAT_FALLBACK_LINE, CHAT_HOLD_SEC + 1.0)
+
+    def _chat_on_disconnect(self):
+        """流到一半断了：把已收到的部分留着，末尾补「…好像断线了」。"""
+        chat_debug("流式连接中途断开（已收到 %d 字）" % len(self._chat_full), "WARN")
+        self._chat_busy = False
+        if not self._chat_full:
+            self._chat_on_error("流式断开且没有收到内容")
+            return
+        self._chat_full = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
+        self._chat_typing = True
+        self._chat_started = True
+        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
+        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
+        self.update()
+
+    def _chat_type_tick(self):
+        """打字机：每个 tick 往前推 CHAT_TYPE_CPS 个字，气泡收掉后归零。"""
+        if not self._chat_full:
+            return
+        n = len(self._chat_full)
+        if self._chat_reveal_n < n:
+            step = CHAT_TYPE_CPS * self.tick_ms / 1000.0
+            self._chat_reveal_n = min(float(n), self._chat_reveal_n + step)
+            shown = self._chat_full[:max(1, int(self._chat_reveal_n))]
+            if shown != self.bubble_text:
+                self.bubble_text = shown
+                self.update()
+            return
+        if self._chat_typing:
+            self._chat_typing = False
+        if self._chat_busy:
+            # 还在收流：两次 token 之间别让气泡过期（模型卡一下也不至于清屏）
+            self.bubble_until = max(float(self.bubble_until or 0.0),
+                                    self._secs() + 2.0)
+            return
+        if self._secs() >= self.bubble_until:
+            self._chat_clear()
+
+    def _chat_clear(self):
+        """气泡到点消失：聊天状态一起清空（下次再来从第 0 字开始）。"""
+        shown = (self._chat_full[:max(1, int(self._chat_reveal_n))]
+                 if self._chat_full else "")
+        if shown and self.bubble_text == shown:
+            self.bubble_text = ""
+        self._chat_reset_state()
+        self.update()
 
     # ---------- 鼠标事件 ----------
     def _forward_mouse_to_menu(self, e):
