@@ -1,5 +1,62 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-22：本地 LLM 聊天 + 五个性格）
+
+需求：给桌宠加本地 LLM 聊天（Ollama）+ 5 个性格；右键「聊天…」、流式气泡打字机。
+**注意**：这个仓库原来没有聊天功能（`BALANCE_URL` 是查余额、`每轮对话消耗` 是读
+Codex/DSH 会话日志算钱），这次是**从零新建**：provider 抽象 + 流式请求 + 打字机 + 人设。
+
+- **provider（全部配置化）**：`DEFAULT_LLM_PROVIDERS` 在 `桌宠.py` 模块级，
+  `config.json` 里是 `llm_provider` + `llm_providers`；业务代码只走
+  `llm_provider_config(cfg)`，不写死 base_url / 模型名。
+  - `ollama-local`：`http://127.0.0.1:11434/v1`、`qwen3.5:4b`、`api_key: "ollama"`、
+    `reasoning_effort: "none"`、`max_tokens: 300`、`temperature: 0.8`、`timeout: 60`。
+  - `deepseek-cloud`（默认不启用，证明以后能切）：`https://api.deepseek.com/v1`、
+    `deepseek-chat`、`api_key_env: "DEEPSEEK_API_KEY"`——**云端 key 只从环境变量读**，
+    配置里不存，代码里也没有。
+  - 环境变量优先：`BIGFISH_LLM_BASE_URL` / `BIGFISH_LLM_MODEL` / `BIGFISH_LLM_API_KEY`。
+  - 老 `config.json` 缺字段会并上默认表（`merge_llm_providers`），升级不用手改。
+- **`reasoning_effort: "none"` 是硬要求**：qwen3 系不带它先"思考"几十秒、content 一直是空；
+  带上后实测 0.6 秒返回 9~10 token。
+- **请求**：`requests.post(..., stream=True, timeout=60)`；
+  `messages = [system(人设+公共规则), 最近 6 轮历史, 本轮 user]`；
+  body 里 `stream/max_tokens/temperature/reasoning_effort` 全从 provider 配置来。
+  人设走 system message，没拼进 user。
+- **流式 / 线程**：HTTP 在 `threading.Thread(daemon=True)`；SSE 用
+  `resp.iter_lines(decode_unicode=False)` 自己按 UTF-8 解（Ollama 的 SSE 头里没 charset，
+  requests 会猜成 latin-1，中文变「ä½」乱码——实测踩过）。逐行取
+  `choices[0].delta.content`，`[DONE]` 收尾；结果 `queue.Queue` 交回主线程，
+  在 `tick()` 最前面 drain，UI 线程绝不等待。
+- **打字机**：`_chat_reveal_n` 每 tick 加 `40 字/秒 × tick_ms`，`bubble_text = full[:int(n)]`，
+  超过 1 个字才切片（不会闪空）；气泡到点消失后 `_chat_clear()` 把字数归零。
+- **历史**：`self._chat_history` 只存内存，成功后 append 一问一答并裁到 12 条（6 轮）；
+  重启清空，不落盘。
+- **五个性格**：`CHAT_PERSONAS`（key 是中文名），公共规则 `CHAT_COMMON_RULES`
+  由 `chat_system_prompt()` 统一拼在末尾；右键「性格」五项互斥打勾，写
+  `cfg["chat_persona"]`，下一条消息生效（不清历史）。
+- **健壮性**：连接失败 / 超时 / 非 200 / SSE 坏 JSON → `ChatError` → 气泡兜底台词
+  「唔…我脑袋卡住了，等一下再问好不好」+ `chat-debug.log` 写 `WARN`（沿用
+  dsh-debug.log 的写文件方式，没引入 logging 框架）；
+  中途断流 → `ChatDisconnected` → 已收到的部分保留 + 末尾「…好像断线了」；
+  生成中再发一条 → 旧 `threading.Event` 置位 + generation 丢弃旧队列结果。
+- **测试**：`_work/test_chat.py` 69 项（假 `requests.post`，不连真模型）；
+  真机探针：`probe_chat_stream.py`（真流式）/ `probe_chat_personas.py`（五性格）/
+  `probe_chat_ui.py`（UI 打字机 + 截图）/ `probe_chat_offline.py`（断网兜底 + 截图）/
+  `probe_chat_menu_real.py`（真屏菜单 + 输入框回车发送）。
+- **已知取舍 / 风险**：
+  - 模型不一定严格守「40 字以内」：偶尔会到 50~60 字（气泡最多五六行，还在
+    `BUBBLE_H` 里；再长会和头顶叠一点）。没有在代码里硬截断，怕截出半句话。
+  - `reasoning_effort` 是 Ollama / vLLM 这类服务的扩展参数；换到别的云端 provider
+    时配置里别写它（`deepseek-cloud` 那条就没写）。
+  - 云端 provider 的 key 只认环境变量 `DEEPSEEK_API_KEY`；没配就 401 / 兜底台词，
+    没有做界面上的填 key 入口（本任务只要求保留配置）。
+  - 聊天内容不落盘；关掉就没了（需求要求"只存内存"）。
+  - 没有做"停止生成"按钮：只有再发一条时才会取消上一条。
+  - `chat-debug.log` 写在 `USER_DIR`（开发时是仓库根，已加进 .gitignore；
+    打包版在 `%APPDATA%\大肥鱼桌宠`）。
+  - 真屏菜单验收用 Qt 鼠标事件而不是物理光标（跑脚本时主人正在用鼠标，
+    注入会抢光标）；建议鼠标空下来时手动右键点一遍「聊天…」和五项性格。
+
 ## v1.1.6 追加（2026-10-22：右键「发个表情」）
 
 需求：右键按情绪抽一张表情包，头顶显示「图 + 一句话」。

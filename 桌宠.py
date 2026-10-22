@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import random
 import re
 import sqlite3
@@ -3361,6 +3362,256 @@ def query_openrouter_balance(key):
         return {"ok": False, "error": str(ex)[:60]}
 
 
+# ---------- 本地 LLM 聊天（OpenAI 兼容：Ollama / DeepSeek） ----------
+# 这个仓库原来**没有聊天功能**：BALANCE_URL 是查余额的，`每轮对话消耗` 是读
+# Codex/DSH 会话日志算钱的，都不是 LLM 调用。这里从零加一条「跟桌宠说话」的路：
+# provider 配置化 + 后台线程流式 SSE + 气泡打字机 + 人设切换。
+#
+# 本地 Ollama 用 OpenAI 兼容口（/v1/chat/completions），qwen3 系必须带
+# `reasoning_effort: "none"`，不然它会先"思考"几十秒、content 一直是空的（实测）。
+DEFAULT_LLM_PROVIDER = "ollama-local"
+DEFAULT_LLM_PROVIDERS = {
+    "ollama-local": {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "qwen3.5:4b",
+        "api_key": "ollama",            # 本机 ollama 不校验，不是密钥
+        "reasoning_effort": "none",
+        "max_tokens": 300,
+        "temperature": 0.8,
+        "timeout": 60,                  # 第一次请求要等模型加载（4~5 秒），别设短
+    },
+    "deepseek-cloud": {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "api_key_env": "DEEPSEEK_API_KEY",   # 云端 key 只从环境变量读，不写配置
+        "max_tokens": 300,
+        "temperature": 0.8,
+        "timeout": 60,
+    },
+}
+LLM_ENV_BASE_URL = "BIGFISH_LLM_BASE_URL"
+LLM_ENV_MODEL = "BIGFISH_LLM_MODEL"
+LLM_ENV_API_KEY = "BIGFISH_LLM_API_KEY"
+
+# 五个性格：key 是中文名（和右键「性格」子菜单一致），值是 system prompt 本体。
+# 末尾的公共规则由 chat_system_prompt() 统一拼，不在这里重复写。
+CHAT_PERSONAS = {
+    "温柔": "你是「小鲸鱼娘」，主人的桌面桌宠。说话温柔、简短，会关心主人有没有吃饭喝水、有没有熬夜。偶尔撒娇，但不腻。",
+    "毒舌": "你是「小鲸鱼娘」，嘴巴很毒但心软。爱吐槽主人摸鱼、熬夜、写 bug，句子短、有梗，但每次损完都要补一句关心。",
+    "元气": "你是「小鲸鱼娘」，精力旺盛。句尾常带「！」和颜文字，鼓励为主，说得又快又冲，像在给主人打气。",
+    "傲娇": "你是「小鲸鱼娘」，嘴硬心软。常用「哼」「才、才不是」，被夸会慌、会转移话题，但事情都会认真记着。",
+    "慵懒": "你是「小鲸鱼娘」，困困的、慢半拍。常用「唔…」「好困」，句子更短，但其实会认真回答。",
+}
+CHAT_PERSONA_DEFAULT = "温柔"
+CHAT_COMMON_RULES = "\n".join([
+    "- 只用简体中文回答",
+    "- 1~2 句、不超过 40 字，像在桌面上随口说话",
+    "- 不要输出 markdown、代码块、列表",
+    "- 不要自称 AI / 模型 / 助手，也不要解释自己有系统提示",
+])
+CHAT_HISTORY_ROUNDS = 6              # 只带最近 6 轮
+CHAT_HISTORY_MAX = CHAT_HISTORY_ROUNDS * 2
+CHAT_TYPE_CPS = 40.0                 # 打字机：约 40 字/秒
+CHAT_HOLD_SEC = 4.0                  # 打完 / 兜底台词在头顶多停几秒
+CHAT_THINKING_LINE = "嗯…我想想"
+CHAT_FALLBACK_LINE = "唔…我脑袋卡住了，等一下再问好不好"
+CHAT_DISCONNECT_LINE = "…好像断线了"
+CHAT_DEBUG_LOG = os.path.join(USER_DIR, "chat-debug.log")
+
+
+class ChatError(Exception):
+    """连接失败 / 非 200 / SSE 解析失败：UI 层拿它换兜底台词，不往用户脸上弹异常。"""
+
+
+class ChatCancelled(Exception):
+    """用户又发了一条：上一条主动取消，不报错、也不出兜底台词。"""
+
+
+class ChatDisconnected(Exception):
+    """流到一半断了：已收到的部分留在气泡里，末尾补一句「…好像断线了」。"""
+
+
+def chat_debug(msg, level="INFO"):
+    """聊天这条路的日志（沿用 dsh-debug.log 那套：只写文件、出错不影响功能）。"""
+    try:
+        with open(CHAT_DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write("%s  %-5s %s\n" % (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, msg))
+    except Exception:
+        pass
+
+
+def merge_llm_providers(raw):
+    """把配置里的 provider 并到默认表上（老配置缺字段自动补，认不出的保留）。"""
+    out = {name: dict(cfg) for name, cfg in DEFAULT_LLM_PROVIDERS.items()}
+    if isinstance(raw, dict):
+        for name, cfg in raw.items():
+            if isinstance(cfg, dict):
+                out.setdefault(str(name), {}).update(cfg)
+    return out
+
+
+def llm_provider_config(cfg):
+    """取当前要用的 provider（读 cfg，不把 base_url / 模型名写死在业务逻辑里）。
+
+    环境变量优先：BIGFISH_LLM_BASE_URL / BIGFISH_LLM_MODEL / BIGFISH_LLM_API_KEY。
+    云端 provider 的 key 只认 api_key_env 指的环境变量，配置里不存。
+    """
+    providers = merge_llm_providers((cfg or {}).get("llm_providers"))
+    name = str((cfg or {}).get("llm_provider") or "").strip()
+    if name not in providers:
+        name = DEFAULT_LLM_PROVIDER
+    prov = dict(providers[name])
+    base = os.environ.get(LLM_ENV_BASE_URL) or prov.get("base_url") or ""
+    model = os.environ.get(LLM_ENV_MODEL) or prov.get("model") or ""
+    key = os.environ.get(LLM_ENV_API_KEY) or prov.get("api_key") or ""
+    if not key:
+        env_name = str(prov.get("api_key_env") or "").strip()
+        if env_name:
+            key = os.environ.get(env_name, "")
+    prov["base_url"] = str(base).strip()
+    prov["model"] = str(model).strip()
+    prov["api_key"] = str(key).strip()
+    prov["name"] = name
+    try:
+        prov["timeout"] = float(prov.get("timeout") or 60)
+    except (TypeError, ValueError):
+        prov["timeout"] = 60.0
+    return prov
+
+
+def chat_system_prompt(persona):
+    """人设 prompt + 统一追加的公共规则（四个字也行，认不出就用默认性格）。"""
+    base = CHAT_PERSONAS.get(str(persona or "")) or CHAT_PERSONAS[CHAT_PERSONA_DEFAULT]
+    return base + "\n" + CHAT_COMMON_RULES
+
+
+def build_chat_messages(persona, history, user_text):
+    """组成发出去的 messages：system（人设）+ 最近 6 轮历史 + 本轮 user。"""
+    msgs = [{"role": "system", "content": chat_system_prompt(persona)}]
+    for item in list(history or [])[-CHAT_HISTORY_MAX:]:
+        try:
+            role = item.get("role")
+            content = item.get("content")
+        except AttributeError:
+            continue
+        if role in ("user", "assistant") and content:
+            msgs.append({"role": role, "content": str(content)})
+    msgs.append({"role": "user", "content": str(user_text)})
+    return msgs
+
+
+def build_chat_payload(provider, messages):
+    """请求体：stream=True；max_tokens / temperature / reasoning_effort 全从 provider 来。"""
+    body = {
+        "model": provider.get("model"),
+        "stream": True,
+        "messages": messages,
+        "max_tokens": int(provider.get("max_tokens", 300)),
+        "temperature": float(provider.get("temperature", 0.8)),
+    }
+    effort = provider.get("reasoning_effort")
+    if effort:
+        # 本地 qwen3 系不带这个会先思考几十秒（content 空），这是硬要求
+        body["reasoning_effort"] = str(effort)
+    return body
+
+
+def parse_sse_line(raw):
+    """解析一行 SSE：返回 ("chunk", 文本) / ("done", None) / None（空行 / 注释 / 没内容）。
+
+    `data: {"choices":[{"delta":{"content":"你"}}]}` → ("chunk", "你")
+    `data: [DONE]` → ("done", None)。JSON 坏了抛 ChatError（UI 层兜底）。
+    """
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+    line = str(raw or "").strip()
+    if not line or line.startswith(":"):
+        return None
+    if not line.startswith("data:"):
+        return None
+    data = line[5:].strip()
+    if not data:
+        return None
+    if data == "[DONE]":
+        return ("done", None)
+    try:
+        obj = json.loads(data)
+    except (TypeError, ValueError) as exc:
+        raise ChatError("SSE 解析失败：%s" % str(exc)[:60]) from exc
+    choices = (obj or {}).get("choices") or []
+    if not choices:
+        return None
+    choice = choices[0] or {}
+    delta = choice.get("delta") or {}
+    piece = delta.get("content")
+    if not piece:
+        message = choice.get("message") or {}
+        piece = message.get("content")
+    if not piece:
+        return None
+    return ("chunk", str(piece))
+
+
+def stream_chat_completion(provider, messages, cancel=None):
+    """后台线程里跑：POST 流式请求，逐段 yield 文本。
+
+    失败分三种：ChatError（连不上 / 非 200 / 解析失败）、ChatDisconnected（收到一部分
+    之后断了）、ChatCancelled（用户发了新的 / 取消了）。调用方负责把它们变成气泡。
+    """
+    base = str(provider.get("base_url") or "").rstrip("/")
+    if not base:
+        raise ChatError("没配置 base_url")
+    url = base + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if provider.get("api_key"):
+        headers["Authorization"] = "Bearer " + str(provider["api_key"])
+    body = build_chat_payload(provider, messages)
+    timeout = float(provider.get("timeout") or 60)
+    chat_debug("请求 %s model=%s max_tokens=%s timeout=%.0fs"
+               % (url, body.get("model"), body.get("max_tokens"), timeout))
+    try:
+        resp = requests.post(url, headers=headers, json=body, stream=True, timeout=timeout)
+    except Exception as exc:
+        raise ChatError("连接失败：%s" % exc.__class__.__name__) from exc
+    got_any = False
+    try:
+        if resp.status_code != 200:
+            detail = ""
+            try:
+                detail = str(getattr(resp, "text", "") or "")[:160]
+            except Exception:
+                pass
+            raise ChatError("HTTP %s %s" % (resp.status_code, detail.strip()))
+        try:
+            # decode_unicode=True 会按响应头猜编码：Ollama 的 SSE 是 UTF-8 但头里没 charset，
+            # requests 会猜成 latin-1，中文就变成「ä½ 」那串乱码。这里自己按 UTF-8 解。
+            for raw in resp.iter_lines(decode_unicode=False):
+                if cancel is not None and cancel.is_set():
+                    raise ChatCancelled()
+                kind = parse_sse_line(raw)
+                if kind is None:
+                    continue
+                if kind[0] == "done":
+                    return
+                got_any = True
+                yield kind[1]
+        except (ChatCancelled, ChatError):
+            raise
+        except Exception as exc:
+            if got_any:
+                raise ChatDisconnected(str(exc)) from exc
+            raise ChatError("读取失败：%s" % exc.__class__.__name__) from exc
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 def extract_usage(obj, depth=0):
     """从任意 agent 的日志行里挖出 token 用量。
 
@@ -5059,11 +5310,20 @@ class PetWindow(QWidget):
             "console_card_radius": 12,
             "console_remember_geo": True,
             "console_geo": "",
-            "console_start_page": "balance"
+            "console_start_page": "balance",
+            # 本地 LLM 聊天（右键「聊天…」）：provider 全部配置化，业务代码不写死
+            # base_url / 模型名；环境变量 BIGFISH_LLM_* 可以临时覆盖。
+            "llm_provider": DEFAULT_LLM_PROVIDER,
+            "llm_providers": merge_llm_providers(None),
+            "chat_persona": CHAT_PERSONA_DEFAULT,
         }
         self.cfg = load_json(CONFIG_PATH, dict(cfg_defaults))
         for cfg_key, cfg_value in cfg_defaults.items():
             self.cfg.setdefault(cfg_key, cfg_value)
+        # 老配置里的 llm_providers 可能只有一条 / 缺字段：按默认表补齐（云端那条保留）
+        self.cfg["llm_providers"] = merge_llm_providers(self.cfg.get("llm_providers"))
+        if self.cfg.get("chat_persona") not in CHAT_PERSONAS:
+            self.cfg["chat_persona"] = CHAT_PERSONA_DEFAULT
         # 老配置里没有 idle_mode / 存了别的值：一律当正常模式，别让脏值传到下面
         if self.cfg.get("idle_mode") not in ("normal", "clear"):
             self.cfg["idle_mode"] = "normal"
@@ -5193,6 +5453,16 @@ class PetWindow(QWidget):
         self._meme_caption = ""
         self._meme_until = 0.0
         self._meme_pressed = False     # 这一下按在表情上（松手不当单击处理）
+        # 本地 LLM 聊天（右键「聊天…」）：后台线程流式取，主线程 tick 里堆字。
+        self._chat_history = []           # 最近 6 轮（12 条），只在内存里，重启清空
+        self._chat_queue = queue.Queue()  # 后台线程 → 主线程：(gen, kind, payload)
+        self._chat_gen = 0                # 每次发送 +1：旧线程的排队结果直接丢掉
+        self._chat_cancel = None          # 当前请求的取消 Event
+        self._chat_full = ""              # 完整回复（打字机按它逐字显示）
+        self._chat_reveal_n = 0.0         # 已经显示到第几个字（浮点，按 tick 累加）
+        self._chat_started = False        # 第一段文本到了没（到之前先显示"嗯…我想想"）
+        self._chat_typing = False         # 打字机还在跑
+        self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -9050,6 +9320,7 @@ class PetWindow(QWidget):
 
     def tick(self):
         self.t += 1
+        self._chat_tick()          # 聊天：收后台结果 + 打字机（各移动模式都要走）
         self._tick_clear_music()   # 通透模式 BGM + 歌词
         self._rice_tick()          # 白饭碗：拖着追 / 不拖抱着
         self._dsh_bar_tick()       # DSH 状态条：贴脚下 / 收后台结果 / 自愈
@@ -9685,6 +9956,9 @@ class PetWindow(QWidget):
             self._set_dir("down", 1)
 
     def _maybe_idle_action(self):
+        # 聊天中（等回复 / 打字机还在冒字）：别乱动、别冒闲话，把气泡让给聊天
+        if self._chat_busy or self._chat_typing or self._chat_full:
+            return
         # 闲着时的"小动作"概率固定 0.03；发呆时说什么、说多勤由主人选的「语录频率」决定
         # （安静 / 正常 / 话多 / 话痨，见 LINE_FREQ_LEVELS）
         preset = LINE_FREQ_LEVELS.get(getattr(self, "line_freq", LINE_FREQ_DEFAULT),
@@ -9980,6 +10254,229 @@ class PetWindow(QWidget):
         busy = max([now, getattr(self, "_trigger_until", 0.0)]
                    + [item[0] for item in self._pending_bubbles])
         return busy + 0.3 if busy > now + 0.01 else None
+
+    # ---------- 本地 LLM 聊天（右键「聊天…」） ----------
+    def chat_persona_name(self):
+        """现在用的是哪个性格（配置里写坏了就回默认，绝不 KeyError）。"""
+        name = str(self.cfg.get("chat_persona") or "")
+        return name if name in CHAT_PERSONAS else CHAT_PERSONA_DEFAULT
+
+    def set_chat_persona(self, name):
+        """右键「性格」里点了一项：写进 config.json，下一条消息生效（历史不动）。"""
+        if name not in CHAT_PERSONAS:
+            return
+        self.cfg["chat_persona"] = name
+        self.save_config()
+        self.say("好，我换成「%s」的性格啦" % name, seconds=2.2, again=True)
+
+    def open_chat_dialog(self):
+        """右键「聊天…」：弹输入框（沿用仓库现有的 QInputDialog 风格）。
+
+        Enter 发送、Esc 取消都是 Qt 对话框自带的行为；这期间桌宠站住不动。
+        """
+        persona = self.chat_persona_name()
+        with self._ui_guard():
+            text, ok = QInputDialog.getText(
+                self,
+                "聊天（%s）" % persona,
+                "想跟小鲸鱼娘说什么？（Enter 发送，Esc 取消）",
+                QLineEdit.EchoMode.Normal,
+                "",
+                Qt.WindowType.WindowStaysOnTopHint)
+        if not ok:
+            return
+        text = (text or "").strip()
+        if text:
+            self.send_chat(text)
+
+    def send_chat(self, user_text):
+        """发一条：先取消上一条，再开后台线程流式请求（UI 线程立刻返回）。"""
+        text = str(user_text or "").strip()
+        if not text:
+            return False
+        self._chat_cancel_previous()
+        self._chat_gen += 1
+        gen = self._chat_gen
+        cancel = threading.Event()
+        self._chat_cancel = cancel
+        self._chat_reset_state()
+        self._chat_busy = True
+        self._freeze_for_chat(8000)
+        provider = llm_provider_config(self.cfg)
+        history = list(self._chat_history)[-CHAT_HISTORY_MAX:]
+        messages = build_chat_messages(self.chat_persona_name(), history, text)
+        # 先占住气泡（等模型那几秒也有话说）
+        self._chat_show_text(CHAT_THINKING_LINE, 60.0)
+        chat_debug("发送：provider=%s model=%s persona=%s 历史=%d 条"
+                   % (provider.get("name"), provider.get("model"),
+                      self.chat_persona_name(), len(history)))
+        threading.Thread(
+            target=self._chat_worker,
+            args=(gen, provider, messages, cancel, text),
+            daemon=True).start()
+        return True
+
+    def _chat_cancel_previous(self):
+        """把上一条的读取循环叫停（它的排队结果会按 gen 丢掉）。"""
+        if self._chat_cancel is not None:
+            try:
+                self._chat_cancel.set()
+            except Exception:
+                pass
+        self._chat_cancel = None
+
+    def _chat_reset_state(self):
+        self._chat_full = ""
+        self._chat_reveal_n = 0.0
+        self._chat_started = False
+        self._chat_typing = False
+
+    def _freeze_for_chat(self, ms):
+        """聊天期间站住不动（rest_until 用的是内部毫秒时钟）。"""
+        self.target = None
+        self.cur_speed = 0.0
+        now_ms = self.t * self.tick_ms
+        self.rest_until = max(getattr(self, "rest_until", 0), now_ms + int(ms))
+
+    def _chat_show_text(self, text, seconds):
+        """直接把一句话放进气泡（不走 say() 的通透模式拦截：聊天是用户自己点的）。"""
+        now = self._secs()
+        self.bubble_card = None
+        self.bubble_inner = False
+        self.bubble_text = text
+        self.bubble_until = now + float(seconds)
+        self._trigger_until = max(float(getattr(self, "_trigger_until", 0.0)),
+                                  now + float(seconds))
+        self.last_line = text
+        self.update()
+
+    def _chat_worker(self, gen, provider, messages, cancel, user_text):
+        """后台线程：只做 HTTP + 解析，结果一律丢回队列，绝不碰 Qt 控件。"""
+        q = self._chat_queue
+        try:
+            for piece in stream_chat_completion(provider, messages, cancel):
+                if cancel.is_set():
+                    return
+                q.put((gen, "chunk", piece))
+            if cancel.is_set():
+                return
+            q.put((gen, "done", user_text))
+        except ChatCancelled:
+            return
+        except ChatDisconnected:
+            q.put((gen, "disconnect", ""))
+        except ChatError as exc:
+            q.put((gen, "error", str(exc)))
+        except Exception as exc:                      # 保险：任何异常都别带崩线程
+            q.put((gen, "error", "%s: %s" % (exc.__class__.__name__, exc)))
+
+    def _chat_tick(self):
+        """每帧：先收后台结果，再推进打字机（放在 tick 最前面，各移动模式都生效）。"""
+        self._chat_drain()
+        self._chat_type_tick()
+
+    def _chat_drain(self):
+        """把后台线程的排队结果在主线程处理掉（非阻塞）。"""
+        while True:
+            try:
+                gen, kind, payload = self._chat_queue.get_nowait()
+            except queue.Empty:
+                break
+            if gen != self._chat_gen:
+                continue                    # 上一条的尾巴：丢了
+            if kind == "chunk":
+                self._chat_on_chunk(payload)
+            elif kind == "done":
+                self._chat_on_done(payload)
+            elif kind == "disconnect":
+                self._chat_on_disconnect()
+            else:
+                self._chat_on_error(payload or "未知错误")
+
+    def _chat_on_chunk(self, piece):
+        piece = str(piece or "")
+        if not piece:
+            return
+        if not self._chat_started:
+            # 第一段到了：把"嗯…我想想"换成真回复，从第 1 个字开始冒
+            self._chat_started = True
+            self._chat_full = ""
+            self._chat_reveal_n = 0.0
+        self._chat_full += piece
+        self._chat_typing = True
+        # 游标不动：模型一次吐一大段也只按 40 字/秒慢慢冒（真·打字机）
+        self.bubble_until = max(float(self.bubble_until or 0.0), self._secs() + 2.0)
+        self.update()
+
+    def _chat_on_done(self, user_text):
+        self._chat_busy = False
+        full = self._chat_full.strip()
+        if not full:
+            self._chat_on_error("模型返回了空内容")
+            return
+        self._chat_history.append({"role": "user", "content": str(user_text)})
+        self._chat_history.append({"role": "assistant", "content": full})
+        del self._chat_history[:-CHAT_HISTORY_MAX]     # 只留最近 6 轮
+        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
+        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
+        self._trigger_until = max(float(self._trigger_until or 0.0),
+                                  self.bubble_until)
+        self._freeze_for_chat(int((remain + CHAT_HOLD_SEC) * 1000))
+        chat_debug("完成：%d 字，历史 %d 条" % (len(full), len(self._chat_history)))
+
+    def _chat_on_error(self, reason):
+        """连不上 / 非 200 / 解析失败：气泡里给兜底台词，日志记 WARN，不弹异常框。"""
+        chat_debug("聊天失败：%s" % reason, "WARN")
+        self._chat_busy = False
+        self._chat_typing = False
+        self._chat_reset_state()
+        self._chat_show_text(CHAT_FALLBACK_LINE, CHAT_HOLD_SEC + 1.0)
+
+    def _chat_on_disconnect(self):
+        """流到一半断了：把已收到的部分留着，末尾补「…好像断线了」。"""
+        chat_debug("流式连接中途断开（已收到 %d 字）" % len(self._chat_full), "WARN")
+        self._chat_busy = False
+        if not self._chat_full:
+            self._chat_on_error("流式断开且没有收到内容")
+            return
+        self._chat_full = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
+        self._chat_typing = True
+        self._chat_started = True
+        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
+        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
+        self.update()
+
+    def _chat_type_tick(self):
+        """打字机：每个 tick 往前推 CHAT_TYPE_CPS 个字，气泡收掉后归零。"""
+        if not self._chat_full:
+            return
+        n = len(self._chat_full)
+        if self._chat_reveal_n < n:
+            step = CHAT_TYPE_CPS * self.tick_ms / 1000.0
+            self._chat_reveal_n = min(float(n), self._chat_reveal_n + step)
+            shown = self._chat_full[:max(1, int(self._chat_reveal_n))]
+            if shown != self.bubble_text:
+                self.bubble_text = shown
+                self.update()
+            return
+        if self._chat_typing:
+            self._chat_typing = False
+        if self._chat_busy:
+            # 还在收流：两次 token 之间别让气泡过期（模型卡一下也不至于清屏）
+            self.bubble_until = max(float(self.bubble_until or 0.0),
+                                    self._secs() + 2.0)
+            return
+        if self._secs() >= self.bubble_until:
+            self._chat_clear()
+
+    def _chat_clear(self):
+        """气泡到点消失：聊天状态一起清空（下次再来从第 0 字开始）。"""
+        shown = (self._chat_full[:max(1, int(self._chat_reveal_n))]
+                 if self._chat_full else "")
+        if shown and self.bubble_text == shown:
+            self.bubble_text = ""
+        self._chat_reset_state()
+        self.update()
 
     # ---------- 鼠标事件 ----------
     def _forward_mouse_to_menu(self, e):
@@ -10660,13 +11157,14 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」「发个表情」三条子菜单。
+        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」「发个表情」「性格」四条子菜单。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
         「动作」是 2026-10-18 加回来的子菜单（真鼠标点过：悬停立刻展开、
         点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一；
-        「发个表情」是 2026-10-22 加的，六种情绪各一项（动作，不打勾）。
+        「发个表情」是 2026-10-22 加的，六种情绪各一项（动作，不打勾）；
+        「聊天…」和「性格」是 2026-10-22 加的本地聊天入口，性格五项互斥打勾。
         其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
@@ -10674,6 +11172,7 @@ class PetWindow(QWidget):
         m.addAction("查看余额", lambda: self.refresh_balance(silent=False))
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        m.addAction("聊天…", defer_dialog(self.open_chat_dialog))
         m.addSeparator()
         # 「动作」是快捷菜单里的子菜单之一：目前只有「高兴跳舞」，
         # 以后别的动作也挂在这儿（ACTION_CLIPS 加一行就会自动出现在菜单里）。
@@ -10700,6 +11199,18 @@ class PetWindow(QWidget):
             meme_menu.addAction(
                 meme_label,
                 lambda _=False, t=meme_tag: self.show_meme(t))
+        # 「性格」：五个互斥、当前性格打勾；切换只写 cfg，下一条消息生效（不清历史）
+        persona_menu = m.addMenu("性格")
+        persona_group = QActionGroup(m)
+        persona_group.setExclusive(True)
+        cur_persona = self.chat_persona_name()
+        for persona_name in CHAT_PERSONAS:
+            a = persona_menu.addAction(persona_name)
+            a.setCheckable(True)
+            a.setChecked(persona_name == cur_persona)
+            persona_group.addAction(a)
+            a.triggered.connect(
+                lambda _=False, name=persona_name: self.set_chat_persona(name))
         m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
