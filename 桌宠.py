@@ -10870,12 +10870,13 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」两条子菜单。
+        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」「性格」三条子菜单。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
         「动作」是 2026-10-18 加回来的子菜单（真鼠标点过：悬停立刻展开、
-        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一。
+        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一；
+        「聊天…」和「性格」是 2026-10-22 加的本地聊天入口，性格五项互斥打勾。
         其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
@@ -10883,6 +10884,7 @@ class PetWindow(QWidget):
         m.addAction("查看余额", lambda: self.refresh_balance(silent=False))
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        m.addAction("聊天…", defer_dialog(self.open_chat_dialog))
         m.addSeparator()
         # 「动作」是快捷菜单里的子菜单之一：目前只有「高兴跳舞」，
         # 以后别的动作也挂在这儿（ACTION_CLIPS 加一行就会自动出现在菜单里）。
@@ -10902,6 +10904,18 @@ class PetWindow(QWidget):
             a.setChecked(self.cfg.get("idle_mode", "normal") == idle_key)
             idle_group.addAction(a)
             a.triggered.connect(lambda _=False, k=idle_key: self.set_idle_mode(k))
+        # 「性格」：五个互斥、当前性格打勾；切换只写 cfg，下一条消息生效（不清历史）
+        persona_menu = m.addMenu("性格")
+        persona_group = QActionGroup(m)
+        persona_group.setExclusive(True)
+        cur_persona = self.chat_persona_name()
+        for persona_name in CHAT_PERSONAS:
+            a = persona_menu.addAction(persona_name)
+            a.setCheckable(True)
+            a.setChecked(persona_name == cur_persona)
+            persona_group.addAction(a)
+            a.triggered.connect(
+                lambda _=False, name=persona_name: self.set_chat_persona(name))
         m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
