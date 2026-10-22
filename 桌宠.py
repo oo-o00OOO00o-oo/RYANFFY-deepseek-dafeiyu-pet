@@ -16,6 +16,7 @@ import math
 import os
 import random
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -4310,6 +4311,160 @@ def paint_starry_bubble(painter, path, rect):
     painter.drawPath(path)
 
 
+# ---------- 表情包图库（只读） ----------
+# 图库是用户自己攒的，放在 %USERPROFILE%\.dsh\meme-packs 下，**不进仓库**：
+# 几百张图几十 MB，进仓库会把每次 clone 拖慢；而且用户随时会加包 / 删图，
+# 代码只负责"按情绪随机抽一张"，不维护副本、也不往图库目录写任何索引。
+MEME_ROOT = os.path.join(os.path.expanduser("~"), ".dsh", "meme-packs")
+# 六种情绪：(index.db 里的 tag, 右键菜单上的中文)
+MEME_TAGS = (("happy", "开心"), ("angry", "生气"), ("sad", "难过"),
+             ("shy", "害羞"), ("confused", "困惑"), ("daily", "日常"))
+MEME_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+MEME_MAX_H = 96          # 表情图最大高度（px）
+MEME_MAX_W = 240         # 表情图最大宽度（px；实际还要跟窗口宽度取小）
+MEME_SECONDS = 5.0       # 表情在头顶挂多久
+MEME_GAP = 4             # 图片和 caption 之间的间距
+MEME_PAD = 5             # 表情气泡的内边距
+
+# 索引缓存：{"root": 上次扫的根目录, "items": [(绝对路径, tag, caption), ...]}
+# 一个进程只扫一次；根目录被换掉（测试 monkeypatch MEME_ROOT）才会重扫。
+_meme_index_cache = {"root": None, "items": None}
+# 缩放缓存：{(路径, 目标宽, 目标高): QPixmap 或 False}。每帧都要画，
+# 绝不能每帧重新解码 PNG（100 帧/秒会卡）；留最近几张就够用。
+_meme_pix_cache = {}
+_MEME_PIX_CACHE_MAX = 8
+
+
+def _meme_root():
+    """图库根目录（每次现读 MEME_ROOT：测试里会 monkeypatch 它）。"""
+    return os.path.realpath(os.path.expanduser(str(MEME_ROOT)))
+
+
+def _meme_db_uri(path):
+    """sqlite 的**只读** URI。Windows 反斜杠要转成 /，空格 / 中文要百分号转义。"""
+    from urllib.parse import quote
+    return "file:" + quote(os.path.abspath(path).replace("\\", "/")) + "?mode=ro"
+
+
+def _meme_abs_inside(root, pack, rel):
+    """把 index.db 里的相对路径拼成绝对路径；越界 / 后缀不对 → None。
+
+    `path` 是相对**包目录**的（例如 memes/sad/xxx.png）。这一行是数据库内容，
+    不可信：`../` 能爬到图库外面，所以拼完必须再验一次"还在 MEME_ROOT 里"。
+    """
+    try:
+        rel = str(rel or "").strip()
+    except Exception:
+        return None
+    if not rel:
+        return None
+    if os.path.splitext(rel)[1].lower() not in MEME_EXTS:
+        return None
+    abs_path = os.path.realpath(os.path.join(pack, rel))
+    try:
+        # Windows 路径大小写不敏感：两边都 normcase 再比
+        root_c = os.path.normcase(os.path.realpath(root))
+        abs_c = os.path.normcase(abs_path)
+        inside = os.path.commonpath([root_c, abs_c]) == root_c
+    except (ValueError, OSError):
+        inside = False
+    return abs_path if inside else None
+
+
+def _scan_meme_packs(root):
+    """扫所有包的 index.db，返回 [(绝对路径, tag, caption), ...]。
+
+    没有 index.db 的包（只有图）直接跳过；读不动的库 / 坏行也跳过，不抛异常。
+    """
+    items = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return items
+    for name in names:
+        pack = os.path.join(root, name)
+        if not os.path.isdir(pack):
+            continue
+        db = os.path.join(pack, "index.db")
+        if not os.path.isfile(db):
+            continue
+        try:
+            con = sqlite3.connect(_meme_db_uri(db), uri=True, timeout=1.0)
+        except sqlite3.Error:
+            continue
+        try:
+            rows = con.execute("SELECT path, tag, caption FROM memes").fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+        for rel, tag, caption in rows:
+            abs_path = _meme_abs_inside(root, pack, rel)
+            if abs_path is None:
+                continue
+            # 索引里可能留着已经被删掉的图（用户手动清理过）：扫的时候就跳过
+            if not os.path.isfile(abs_path):
+                continue
+            items.append((abs_path, (tag or "").strip(), (caption or "").strip()))
+    return items
+
+
+def _meme_items(force=False):
+    """索引（进程内缓存）。force=True 强制重扫一次（图被删了的时候用）。"""
+    root = _meme_root()
+    cache = _meme_index_cache
+    if force or cache["items"] is None or cache["root"] != root:
+        cache["root"] = root
+        cache["items"] = _scan_meme_packs(root)
+    return cache["items"]
+
+
+def pick_meme(tag=None):
+    """按情绪抽一张表情：返回 (绝对路径, caption) 或 None。
+
+    - 该 tag 一张都没有 → 退回全库随机（用户图库里某一类可能是空的）
+    - 文件已经不在了 → 跳过；一张可用的都没有就重扫一次索引再试
+    """
+    tag = str(tag or "").strip().lower()
+    for force in (False, True):
+        try:
+            items = _meme_items(force=force)
+        except Exception:
+            items = []
+        usable = [it for it in items if os.path.isfile(it[0])]
+        same_tag = [it for it in usable if it[1] == tag] if tag else []
+        pool = same_tag or usable
+        if pool:
+            abs_path, _tag, caption = random.choice(pool)
+            return abs_path, caption
+    return None
+
+
+def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
+    """把表情缩放到 max_w × max_h 里（等比、保 alpha），按 (路径, 目标尺寸) 缓存。"""
+    max_w, max_h = max(1, int(max_w)), max(1, int(max_h))
+    key = (path, max_w, max_h)
+    hit = _meme_pix_cache.get(key)
+    if hit is not None:
+        return hit if hit is not False else None
+    pm = QPixmap(path)
+    if pm.isNull():
+        _meme_pix_cache[key] = False        # 坏图 / 读不动：也记一笔，别每帧重试
+        return None
+    if pm.width() > max_w or pm.height() > max_h:
+        # SmoothTransformation 保住透明通道（带 alpha 的 PNG 不能变黑底）
+        pm = pm.scaled(int(max_w), int(max_h), Qt.AspectRatioMode.KeepAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation)
+    if len(_meme_pix_cache) >= _MEME_PIX_CACHE_MAX:
+        for old in list(_meme_pix_cache)[: max(1, _MEME_PIX_CACHE_MAX // 2)]:
+            _meme_pix_cache.pop(old, None)
+    _meme_pix_cache[key] = pm
+    return pm
+
+
 def wrap_text(fm, text, max_w):
     """按像素宽度折行：中文逐字折，英文整词折（别把单词劈两半）。"""
     lines, cur = [], ""
@@ -5032,6 +5187,12 @@ class PetWindow(QWidget):
         self.bubble_until = 0
         self.bubble_inner = False
         self.bubble_card = None        # 问答卡片（有它就不画普通台词气泡）
+        # 表情气泡（右键「发个表情」）：图和 caption 画在同一个气泡区，5 秒自动收。
+        # _meme_path 非空 = 表情正占着气泡区（优先于普通台词气泡）。
+        self._meme_path = None
+        self._meme_caption = ""
+        self._meme_until = 0.0
+        self._meme_pressed = False     # 这一下按在表情上（松手不当单击处理）
         self.last_speak_tick = 0
         self.t = 0
         self.jump_t = 0
@@ -7029,6 +7190,9 @@ class PetWindow(QWidget):
                 self._paint_question_card(p, ink)
             else:
                 self._paint_note_bubble(p, ink)
+        elif mode == "meme":
+            # 表情气泡：图 + 一句话（点一下 / 到点都会收）
+            self._paint_meme_bubble(p, self._bubble_ink())
         elif mode == "balance":
             # 余额气泡：余额 / 今日已用（数字带滚动动画）
             ink = self._bubble_ink()
@@ -7240,6 +7404,73 @@ class PetWindow(QWidget):
             p.drawText(QRectF(bx, by + pad_y + i * line_h, bw, line_h),
                        Qt.AlignmentFlag.AlignCenter, l)
 
+    def _meme_caption_text(self, fm, max_w):
+        """表情配文一行：放不下就用省略号（超长 caption 不能把气泡撑出窗口）。"""
+        return ellipsize(fm, self._meme_caption or "", max(24, max_w))
+
+    def _meme_layout(self):
+        """算表情气泡的排版（布局单独拆出来，回归测试直接量它）。
+
+        返回 dict（pix / cap / bw / bh / bx / by …）；没图 / 坏图返回 None。
+        尺寸：图等比缩到高 ≤ 96、宽 ≤ min(240, 窗口宽-8)，再给 caption 和内边距
+        让位 —— 图片 + caption 总高不超过 BUBBLE_H。
+        """
+        if not self._meme_path:
+            return None
+        f_cap = QFont(self.bubble_font)
+        f_cap.setPointSize(10)
+        f_cap.setWeight(QFont.Weight.Medium)
+        f_cap.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        fm_cap = QFontMetrics(f_cap)
+        cap_h = fm_cap.height()
+        # 气泡本体能用的高度：BUBBLE_H 再给尾巴留 10px（_bubble_top 那套）
+        budget_h = BUBBLE_H - 10
+        inner_max_w = max(24, min(MEME_MAX_W, self.width() - 8) - MEME_PAD * 2)
+        max_img_h = max(8, min(MEME_MAX_H,
+                               budget_h - cap_h - MEME_GAP - MEME_PAD * 2))
+        pix = load_meme_pixmap(self._meme_path, inner_max_w, max_img_h)
+        if pix is None:
+            return None
+        pw, ph = pix.width(), pix.height()
+        cap = self._meme_caption_text(fm_cap, inner_max_w)
+        bw = min(max(pw, fm_cap.horizontalAdvance(cap)) + MEME_PAD * 2,
+                 self.width() - 6)
+        bh = ph + MEME_GAP + cap_h + MEME_PAD * 2
+        return {"pix": pix, "f_cap": f_cap, "fm_cap": fm_cap, "cap": cap,
+                "cap_h": cap_h, "pw": pw, "ph": ph, "bw": bw, "bh": bh,
+                "bx": (self.width() - bw) / 2.0,
+                "by": self._bubble_top(bh + 10)}
+
+    def _paint_meme_bubble(self, p, ink):
+        """表情气泡：星空气泡底 + 居中一张图 + 下面一行 caption。
+
+        尺寸 / 省略号都在 `_meme_layout()` 里算好；这里只管画。
+        """
+        lay = self._meme_layout()
+        if lay is None:
+            return
+        pix, bw, bh, bx, by = (lay["pix"], lay["bw"], lay["bh"],
+                               lay["bx"], lay["by"])
+        rect = QRectF(bx, by, bw, bh)
+        path = bubble_path(rect, 14, self.width() / 2.0, 9)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(ink["shadow"])
+        p.save()
+        p.translate(0, 2)
+        p.drawPath(path)
+        p.restore()
+        self._paint_bubble_body(p, path, rect, ink)
+        # 图居中（透明通道靠 drawPixmap 原样带过去）
+        ix = bx + (bw - lay["pw"]) / 2.0
+        iy = by + MEME_PAD
+        p.drawPixmap(QRectF(ix, iy, lay["pw"], lay["ph"]), pix,
+                     QRectF(0, 0, pix.width(), pix.height()))
+        p.setFont(lay["f_cap"])
+        p.setPen(ink["fg"])
+        p.drawText(QRectF(bx + MEME_PAD, iy + lay["ph"] + MEME_GAP,
+                          bw - MEME_PAD * 2, lay["cap_h"]),
+                   Qt.AlignmentFlag.AlignCenter, lay["cap"])
+
     def _paint_question_card(self, p, ink):
         """DSH 提问卡片：标题 + 题面 + 选项胶囊 + 右下角"点我去回答"。
 
@@ -7346,12 +7577,18 @@ class PetWindow(QWidget):
         return self.t * self.tick_ms / 1000.0
 
     def _bubble_mode(self, now):
-        """气泡区这会儿该显示什么：text（说话）/ balance（余额）/ lyric（歌词）。
+        """气泡区这会儿该显示什么：meme（表情）/ text（说话）/ balance（余额）/ lyric（歌词）。
 
+        表情优先于普通台词：同一块区域，表情挂着的这几秒先画表情，
+        表情一收（到点 / 点一下）文字气泡自己回来（bubble_until 还留着）。
         放歌时歌词优先于「余额常显」——想瞄一眼余额就快速双击（显示 5 秒）。
         """
+        self._expire_meme(now)          # 到点就自己收
+        if self._meme_path is not None:
+            return "meme"
         if self._clear_lyrics_only():
             # 通透模式只放歌词：余额 / 外部歌词 / 问答卡片都不进气泡
+            # （表情是用户自己点的，不在这条限制里——见 show_meme）
             if self.bubble_text and now < self.bubble_until:
                 return "text"
             return None
@@ -9664,6 +9901,41 @@ class PetWindow(QWidget):
         with self._ui_guard():
             dlg.exec()
 
+    # ---------- 表情气泡（右键「发个表情」） ----------
+    def show_meme(self, tag=None, seconds=None):
+        """按情绪抽一张表情挂在头顶；图库里这一类一张都没有就在气泡里说一句。
+
+        返回 True = 抽到了；False = 没有可用的图（那句话说在气泡里）。
+        """
+        got = pick_meme(tag)
+        if not got:
+            self.say("我这儿没有这类表情诶", again=True)
+            return False
+        self._meme_path, self._meme_caption = got
+        self._meme_until = self._secs() + (MEME_SECONDS if seconds is None
+                                           else max(0.2, float(seconds)))
+        self.update()
+        return True
+
+    def clear_meme(self, repaint=True):
+        """收掉头顶的表情（点一下 / 到点 / 换一张都会走这里）。"""
+        self._meme_path = None
+        self._meme_caption = ""
+        self._meme_until = 0.0
+        if repaint:
+            self.update()
+
+    def meme_active(self):
+        """表情这会儿是不是还在（到点的那个瞬间就不算了）。"""
+        return self._meme_path is not None and self._secs() < self._meme_until
+
+    def _expire_meme(self, now):
+        """到点就自己收（顺带让文字气泡回来）。返回 True = 刚收掉。"""
+        if self._meme_path is not None and now >= self._meme_until:
+            self.clear_meme(repaint=False)
+            return True
+        return False
+
     def say(self, text, inner=False, seconds=2.8, again=False, idle=False, queue=False,
             lyric=False):
         """冒一句话。
@@ -9739,6 +10011,16 @@ class PetWindow(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            # 表情挂着头顶时点一下 = 立刻收（不蹦、不响，也不算单击/双击）
+            if self.meme_active():
+                self._meme_pressed = True
+                self.clear_meme()
+                self._last_click_ms = -99999
+                self._single_pending = None
+                self.last_press_pos = None
+                self.drag_start_pos = None
+                return
+            self._meme_pressed = False
             # 点在歌词气泡那几颗 ⏮ / ⏸▶ / ⏭ 上：不进"蹦一下 + 响一声"那套，
             # 等松手再看点的是哪一颗（切歌 / 切播放暂停）
             kind = self._lyric_btn_kind(e.position())
@@ -9783,6 +10065,11 @@ class PetWindow(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._meme_pressed:
+            # 刚才那一下按在表情上：只收表情，不当成单击（不蹦也不说话）
+            self._meme_pressed = False
+            self._press_on_lyric_btn = None
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             pressed = getattr(self, "_press_on_lyric_btn", None)
             if pressed:
@@ -10373,12 +10660,13 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」两条子菜单。
+        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」「发个表情」三条子菜单。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
         「动作」是 2026-10-18 加回来的子菜单（真鼠标点过：悬停立刻展开、
-        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一。
+        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一；
+        「发个表情」是 2026-10-22 加的，六种情绪各一项（动作，不打勾）。
         其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
@@ -10405,6 +10693,13 @@ class PetWindow(QWidget):
             a.setChecked(self.cfg.get("idle_mode", "normal") == idle_key)
             idle_group.addAction(a)
             a.triggered.connect(lambda _=False, k=idle_key: self.set_idle_mode(k))
+        # 「发个表情」：六种情绪各一项，点了就从 ~/.dsh/meme-packs 按 tag 抽一张。
+        # 这是**动作**不是开关，所以不加勾选（点完菜单自己关、气泡里出图）。
+        meme_menu = m.addMenu("发个表情")
+        for meme_tag, meme_label in MEME_TAGS:
+            meme_menu.addAction(
+                meme_label,
+                lambda _=False, t=meme_tag: self.show_meme(t))
         m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)

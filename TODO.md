@@ -1,5 +1,43 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-22：右键「发个表情」）
+
+需求：右键按情绪抽一张表情包，头顶显示「图 + 一句话」。
+
+- **图库路径**：`%USERPROFILE%\.dsh\meme-packs`（本机 = `C:\Users\16050\.dsh\meme-packs`），
+  每个包一个子目录；常量 `MEME_ROOT` 在 `桌宠.py` 模块级（测试里 monkeypatch 它换假库）。
+- **schema**：包内 `index.db`（SQLite），表
+  `memes(path, tag, file_name, caption, keywords, mtime, captioned_at)`；
+  `path` 是**相对包目录**的（如 `memes/sad/xxx.png`），拼绝对路径要
+  `os.path.join(包目录, path)`。`caption` 是中文一句话，直接当表情配文。
+- **6 个 tag**：`happy / angry / sad / shy / confused / daily`
+  （菜单上中文：开心 / 生气 / 难过 / 害羞 / 困惑 / 日常，见 `MEME_TAGS`）。
+- **只读约束**：`sqlite3.connect('file:...?mode=ro', uri=True)`；代码不往图库目录写任何
+  索引 / 缓存 / 缩略图，也不改 db。缓存只在进程内存里
+  （`_meme_index_cache` / `_meme_pix_cache`）。
+- **越界防护**：`index.db` 里带 `../` / 绝对路径的行，拼完再用 `realpath + commonpath`
+  验一次必须还在 `MEME_ROOT` 内；后缀只认 png/jpg/jpeg/webp/gif；文件不存在就跳过。
+- **为什么图不进仓库**：439 张图几十 MB，进仓库会拖慢 clone / 发版，而且这些图是用户
+  自己攒的、随时会增删；仓库只放"怎么读"，图由用户本机提供。
+  没有 index.db 的包直接跳过、不报错。
+- **显示**：表情和台词共用一块气泡区（`_bubble_top()`），表情优先；图等比缩到高 ≤96、
+  宽 ≤min(240, 窗口宽-8)，caption 10pt 一行、超宽省略；图片 + caption 总高 ≤ BUBBLE_H；
+  星空气泡底 `paint_starry_bubble` 包着，5 秒自动收、点一下立刻收。
+- **缓存**：缩放到位的 QPixmap 按 (路径, 目标宽, 目标高) 缓存在 `_meme_pix_cache`
+  （最多 8 张），不会每帧重新解码 PNG；带 alpha 的 PNG 用 SmoothTransformation 缩放，
+  透明通道保住。
+- **测试**：`_work/test_meme.py` 58 项（假图库在临时目录，绝不读真库）；
+  真库探针 `_work/probe_meme_real.py`；真屏菜单探针 `_work/probe_meme_menu_real.py`。
+- **已知取舍 / 风险**：
+  - `official-001` 包里除了六类还有 `baka/color/cpu/...` 等自定义 tag，代码只在
+    "这一类没有图 → 退回全库"时可能抽到，属预期行为。
+  - 图库是用户手改的：只读打开失败（锁住 / 坏库）就跳过那个包，不报错也不弹窗。
+  - 没做"菜单里显示当前图库有多少张"这类提示；抽不到时只有气泡一句。
+  - 图片解码失败（坏图）时这次不显示，5 秒后照旧收；没有额外报错提示。
+  - 本机的鼠标当时正被主人使用（`GetCursorPos` 每 100ms 变一次），物理鼠标注入会抢光标，
+    所以真屏验收用的是"真菜单 + Qt 鼠标事件"，没有做物理点击；等主人的鼠标空下来
+    建议手动右键点一遍六项。
+
 ## v1.1.6 追加（2026-10-19：高兴跳舞 / 抢 token 哭的动作音频）
 
 需求：给「高兴跳舞」和「抢 token 哭」配一次性音频，音频文件直接进仓库。
