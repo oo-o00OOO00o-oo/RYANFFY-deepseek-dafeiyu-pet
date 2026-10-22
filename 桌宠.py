@@ -4622,10 +4622,31 @@ def _meme_abs_inside(root, pack, rel):
     return abs_path if inside else None
 
 
+def _meme_path_ok(path):
+    """一条**绝对路径**能不能当表情显示：后缀对、文件在、而且还在图库根目录里。
+
+    表情抽屉是点哪张显示哪张（`show_meme_path`），所以入口再验一遍：不信任调用方传进来的路径。
+    """
+    try:
+        p = os.path.realpath(str(path or ""))
+    except (TypeError, ValueError, OSError):
+        return False
+    if not p or not os.path.isfile(p):
+        return False
+    if os.path.splitext(p)[1].lower() not in MEME_EXTS:
+        return False
+    try:
+        root = os.path.normcase(_meme_root())
+        return os.path.commonpath([root, os.path.normcase(p)]) == root
+    except (ValueError, OSError):
+        return False
+
+
 def _scan_meme_packs(root):
-    """扫所有包的 index.db，返回 [(绝对路径, tag, caption), ...]。
+    """扫所有包的 index.db，返回 [(绝对路径, tag, caption, keywords), ...]。
 
     没有 index.db 的包（只有图）直接跳过；读不动的库 / 坏行也跳过，不抛异常。
+    keywords 一起读出来给聊天面板的搜索用（按 caption + keywords 子串匹配）。
     """
     items = []
     try:
@@ -10182,9 +10203,9 @@ class PetWindow(QWidget):
         with self._ui_guard():
             dlg.exec()
 
-    # ---------- 表情气泡（右键「发个表情」） ----------
+    # ---------- 表情气泡（右键「发个表情」/ 表情抽屉） ----------
     def show_meme(self, tag=None, seconds=None):
-        """按情绪抽一张表情挂在头顶；图库里这一类一张都没有就在气泡里说一句。
+        """按情绪随机抽一张挂在头顶；图库里这一类一张都没有就在气泡里说一句。
 
         返回 True = 抽到了；False = 没有可用的图（那句话说在气泡里）。
         """
@@ -10192,7 +10213,18 @@ class PetWindow(QWidget):
         if not got:
             self.say("我这儿没有这类表情诶", again=True)
             return False
-        self._meme_path, self._meme_caption = got
+        return self.show_meme_path(got[0], got[1], seconds=seconds)
+
+    def show_meme_path(self, path, caption="", seconds=None):
+        """把**指定的一张**表情挂到头顶（表情抽屉点了哪张就是哪张，不再随机抽）。
+
+        只在桌面上显示，不进聊天历史、不污染 LLM 上下文。
+        路径不合法（被删 / 越界 / 后缀不对）返回 False。
+        """
+        if not _meme_path_ok(path):
+            return False
+        self._meme_path = os.path.realpath(str(path))
+        self._meme_caption = str(caption or "")
         self._meme_until = self._secs() + (MEME_SECONDS if seconds is None
                                            else max(0.2, float(seconds)))
         self.update()
