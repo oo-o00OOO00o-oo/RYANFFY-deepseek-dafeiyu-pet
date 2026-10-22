@@ -4578,6 +4578,17 @@ MEME_MAX_W = 240         # 表情图最大宽度（px；实际还要跟窗口宽
 MEME_SECONDS = 5.0       # 表情在头顶挂多久
 MEME_GAP = 4             # 图片和 caption 之间的间距
 MEME_PAD = 5             # 表情气泡的内边距
+# 表情斗图：主人发来一张后，她按"相近情绪"回一张（参考 dsh-meme 的一来一回）
+MEME_REPLY_TAGS = {
+    "happy": ("happy", "daily", "shy"),
+    "angry": ("sad", "shy", "confused"),
+    "sad": ("happy", "daily", "shy"),
+    "shy": ("happy", "shy", "daily"),
+    "confused": ("confused", "daily", "happy"),
+    "daily": ("happy", "daily", "confused"),
+}
+MEME_REPLY_DELAY_MS = 1200     # 自己那张先挂 1.2 秒，再换成她回的
+MEME_USER_SECONDS = 1.2        # 主人发的那张在头顶停留多久（之后被回复替换）
 
 # 索引缓存：{"root": 上次扫的根目录, "items": [(绝对路径, tag, caption, keywords), ...]}
 # 一个进程只扫一次；根目录被换掉（测试 monkeypatch MEME_ROOT）才会重扫。
@@ -5509,17 +5520,20 @@ class ChatPanel(QWidget):
     def _on_cell_clicked(self, index):
         if 0 <= index < len(self._shown):
             path, _tag, caption, _keywords = self._shown[index]
-            # 只在桌面上显示，不进聊天历史、不污染 LLM 上下文
-            self.pet.show_meme_path(path, caption)
+            # 先把自己发的这张挂出来，过一会儿她回一张（不污染聊天历史）
+            self.pet.send_meme(path, caption)
 
     # ---------- 键盘 ----------
+    def _handle_escape(self):
+        if self._drawer_open:
+            self.toggle_drawer()
+            self._input.setFocus()
+        else:
+            self.close_panel()
+
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key.Key_Escape:
-            if self._drawer_open:
-                self.toggle_drawer()
-                self._input.setFocus()
-            else:
-                self.close_panel()
+            self._handle_escape()
             return
         super().keyPressEvent(ev)
 
@@ -11022,6 +11036,7 @@ class PetWindow(QWidget):
 
         返回 True = 抽到了；False = 没有可用的图（那句话说在气泡里）。
         """
+        self._meme_reply_cancel()
         got = pick_meme(tag)
         if not got:
             self.say("我这儿没有这类表情诶", again=True)
@@ -11042,6 +11057,67 @@ class PetWindow(QWidget):
                                            else max(0.2, float(seconds)))
         self.update()
         return True
+
+    def send_meme(self, path, caption="", reply_delay=None):
+        """表情抽屉点了一张：先挂出自己发的，过一会儿按相近情绪回一张（斗图）。
+
+        参考 dsh-meme 的一来一回：主人发一张 → 她回一张，面板一直开着。
+        这条只动头顶显示，不进 `_chat_history`，不污染 LLM 上下文。
+        """
+        self._meme_reply_cancel()
+        if not self.show_meme_path(path, caption, seconds=MEME_USER_SECONDS):
+            return False
+        self._meme_reply_tag = self._pick_reply_tag(self._meme_tag_of(path))
+        if self._meme_reply_timer is None:
+            self._meme_reply_timer = QTimer(self)
+            self._meme_reply_timer.setSingleShot(True)
+            self._meme_reply_timer.timeout.connect(self._meme_reply_now)
+        delay = MEME_REPLY_DELAY_MS if reply_delay is None else max(0, int(reply_delay))
+        self._meme_reply_timer.start(delay)
+        return True
+
+    def _meme_reply_cancel(self):
+        if self._meme_reply_timer is not None:
+            self._meme_reply_timer.stop()
+
+    def _meme_tag_of(self, path):
+        """这条绝对路径在图库里的 tag（认不出就空串）。"""
+        try:
+            p = os.path.normcase(os.path.realpath(str(path)))
+        except (TypeError, ValueError, OSError):
+            return ""
+        for item in _meme_items():
+            if os.path.normcase(item[0]) == p:
+                return item[1]
+        return ""
+
+    def _pick_reply_tag(self, tag):
+        """按"相近情绪"挑一个真的有图的 tag 回敬；都喜欢就随机。"""
+        candidates = list(MEME_REPLY_TAGS.get(tag) or [])
+        candidates += [t for t, _label in MEME_TAGS if t not in candidates]
+        random.shuffle(candidates)
+        items = _meme_items()
+        for cand in candidates:
+            if any(item[1] == cand for item in items):
+                return cand
+        return ""
+
+    def _meme_reply_now(self):
+        """斗图回复：抽一张（尽量别跟刚发的那张重复）挂到头顶。"""
+        tag = self._meme_reply_tag
+        got = pick_meme(tag) if tag else None
+        if got and self._meme_path and \
+                os.path.normcase(got[0]) == os.path.normcase(self._meme_path):
+            again = pick_meme(tag)
+            if again:
+                got = again
+        if not got:
+            got = pick_meme(None)
+        if not got:
+            self.say("我这儿没有这类表情诶", again=True)
+            return
+        chat_debug("斗图：回一张 tag=%s" % (self._meme_tag_of(got[0]) or "?"))
+        self.show_meme_path(got[0], got[1], seconds=MEME_SECONDS)
 
     def clear_meme(self, repaint=True):
         """收掉头顶的表情（点一下 / 到点 / 换一张都会走这里）。"""
@@ -14413,6 +14489,7 @@ class PetWindow(QWidget):
                 self._rice_carry_update(snap=True)
 
     def quit_app(self):
+        self._meme_reply_cancel()
         self.close_chat_panel()
         self._unregister_hotkeys()        # 全局快捷键要还给系统，不然退出后这个键就废了
         self._stop_sfx_media()
