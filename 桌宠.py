@@ -9819,6 +9819,41 @@ class PetWindow(QWidget):
         with self._ui_guard():
             dlg.exec()
 
+    # ---------- 表情气泡（右键「发个表情」） ----------
+    def show_meme(self, tag=None, seconds=None):
+        """按情绪抽一张表情挂在头顶；图库里这一类一张都没有就在气泡里说一句。
+
+        返回 True = 抽到了；False = 没有可用的图（那句话说在气泡里）。
+        """
+        got = pick_meme(tag)
+        if not got:
+            self.say("我这儿没有这类表情诶", again=True)
+            return False
+        self._meme_path, self._meme_caption = got
+        self._meme_until = self._secs() + (MEME_SECONDS if seconds is None
+                                           else max(0.2, float(seconds)))
+        self.update()
+        return True
+
+    def clear_meme(self, repaint=True):
+        """收掉头顶的表情（点一下 / 到点 / 换一张都会走这里）。"""
+        self._meme_path = None
+        self._meme_caption = ""
+        self._meme_until = 0.0
+        if repaint:
+            self.update()
+
+    def meme_active(self):
+        """表情这会儿是不是还在（到点的那个瞬间就不算了）。"""
+        return self._meme_path is not None and self._secs() < self._meme_until
+
+    def _expire_meme(self, now):
+        """到点就自己收（顺带让文字气泡回来）。返回 True = 刚收掉。"""
+        if self._meme_path is not None and now >= self._meme_until:
+            self.clear_meme(repaint=False)
+            return True
+        return False
+
     def say(self, text, inner=False, seconds=2.8, again=False, idle=False, queue=False,
             lyric=False):
         """冒一句话。
@@ -10528,12 +10563,13 @@ class PetWindow(QWidget):
         self._dsh_bar_follow()
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」两条子菜单。
+        """右键菜单（v1.1.0 起瘦身版）：现在有「动作」「待机模式」「发个表情」三条子菜单。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
         「动作」是 2026-10-18 加回来的子菜单（真鼠标点过：悬停立刻展开、
-        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一。
+        点「高兴跳舞」能触发）；「待机模式」是 2026-10-19 加的，正常 / 通透二选一；
+        「发个表情」是 2026-10-22 加的，六种情绪各一项（动作，不打勾）。
         其余仍保持扁平，不重复那套老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
         """
@@ -10560,6 +10596,13 @@ class PetWindow(QWidget):
             a.setChecked(self.cfg.get("idle_mode", "normal") == idle_key)
             idle_group.addAction(a)
             a.triggered.connect(lambda _=False, k=idle_key: self.set_idle_mode(k))
+        # 「发个表情」：六种情绪各一项，点了就从 ~/.dsh/meme-packs 按 tag 抽一张。
+        # 这是**动作**不是开关，所以不加勾选（点完菜单自己关、气泡里出图）。
+        meme_menu = m.addMenu("发个表情")
+        for meme_tag, meme_label in MEME_TAGS:
+            meme_menu.addAction(
+                meme_label,
+                lambda _=False, t=meme_tag: self.show_meme(t))
         m.addSeparator()
         m.addAction("把 DeepSeek Harness 叫到前面", self.dsh_wake)
         m.addAction("重启 DeepSeek Harness（窗口卡死时）", self.dsh_restart)
