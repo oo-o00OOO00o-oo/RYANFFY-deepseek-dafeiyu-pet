@@ -1,5 +1,47 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-23：按 modern_chat_interface 重做 + 拆文件）
+
+需求：照着 `C:\Users\16050\Downloads\modern_chat_interface.html` 写聊天界面；
+删掉右键「发个表情」；聊天里发的表情包要能在聊天记录里看到；`桌宠.py` 按功能拆文件。
+
+- **界面**（`chat_ui.py`）：
+  - 420×346（展开抽屉 666）；白玻璃 / 浅灰底 + 很淡的靛紫光晕 + 圆角 20 + slate 描边。
+  - 标题区：`小鲸鱼娘`（16 磅粗）+ `{性格} · 在线`（绿色）+ ×；
+  - 消息气泡：左白、右靛紫渐变；圆角不对称（贴头像那角 5px，其余 16px）；
+    右侧加 `QGraphicsDropShadowEffect` 靛紫光。
+  - 输入区：药丸形 `QTextEdit`（radius 22）+ 圆形 ➤ 发送键（靛紫渐变）；
+  - 头像：她 = 立绘裁头；我 = 靛紫渐变 + 「你」。
+  - 没有照搬 HTML 的"日期分割线 / 每条时间戳 / call/video 图标"；面板是桌宠的小窗，
+    这些先不加。
+- **表情包进聊天记录**：`ChatMessageRow` 增加 `image` 模式：
+  - `chat_image_pixmap(path)` 缩到 ≤220×150，放白卡 / 靛紫卡里，下面一行 caption；
+  - `PetWindow.chat_ui_add(role, text, image=path)` 存 `{"role","text","image"}`；
+  - `send_meme` / `_meme_reply_now` 都用图片卡记录；面板关闭时也存，重开 `set_log()` 重画。
+- **删右键「发个表情」**：`_build_quick_menu()` 里那三行删掉；
+  `show_meme()` / `pick_meme()` 保留（表情抽屉、斗图、测试还在用）。
+- **拆文件**（2026-10-23）：
+  - `llm_chat.py`：provider / 人设 / 请求体 / SSE / 流式；不依赖 Qt；
+    `stream_chat_completion(..., log=callable)` 把日志回调给主程序。
+  - `meme_store.py`：meme-packs 只读索引 / 抽图 / `load_meme_pixmap`；
+    `root=None` 时用模块自己的 `MEME_ROOT`，主程序把 `桌宠.MEME_ROOT` 显式传进来。
+  - `chat_ui.py`：面板 / 行 / 头像 / 格子池 / 缩略图缓存；不 import 桌宠，
+    通过 `self.pet` 拿字体、形象、`meme_items()`。
+  - `桌宠.py`：入口 + 桌宠本体；re-export 三个模块的旧名字（测试兼容）。
+    `make_zip.py` 文件列表、`桌宠.spec` hiddenimports 都补上 4 个模块。
+- **测试**：`test_meme_picker` 91 项（新增图片卡/右键菜单删除）、
+  `test_chat` 79 项、`test_meme` 55 项（右键菜单断言改成"不再有"）。
+  真机 `probe_qq_panel.py` 10 项。
+- **已知取舍 / 风险**：
+  - 只拆了"聊天 / 图库 / 聊天界面"三块；桌宠本体（动画、余额、歌词、金币、饭碗）
+    还在 `桌宠.py`（约 1.15 万行），再拆收益小、牵一发动全身。
+  - 新模块靠 `sys.path` 直接 import；PyInstaller 的 spec 已加 hiddenimports，
+    但本机没装 PyInstaller，**打包没实测**。
+  - 图片卡不是聊天记录的虚拟化列表：最多 40 行，每行一张图，量大时会占内存。
+  - 没有时间戳 / 已读回执 / 日期分割线；这些是 HTML 里的装饰，不是桌宠刚需。
+  - 表情图卡上限 220×150，长图会等比缩小；点图片没有"看大图"。
+  - 真屏验收仍用 Qt 鼠标事件，物理鼠标没注入。
+
 ## v1.1.6 追加（2026-10-23：QQ 风聊天面板）
 
 需求：聊天面板按"动漫 QQ 聊天界面"重做：半透明粉彩天空、可爱标题、左她右我消息气泡、

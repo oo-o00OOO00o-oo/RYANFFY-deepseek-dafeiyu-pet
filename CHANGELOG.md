@@ -2,6 +2,29 @@
 
 ## v1.1.6（未发布）
 
+### 聊天界面按 modern_chat_interface 重做；表情包直接进聊天记录；代码拆成几个文件
+
+- 聊天面板换成白玻璃 / 浅灰底 + 靛紫高光（照 `modern_chat_interface.html` 的感觉）：
+  标题区「小鲸鱼娘 / 温柔 · 在线」、左右消息气泡、圆形头像。
+  气泡改成 IM 那种「贴着头像的那一角小圆角、其余大圆角」；我的消息是靛紫渐变 + 发光。
+  输入区变成药丸形，右边是圆形 ➤ 发送键。
+- 聊天里发的表情包现在是**图片卡**（缩略图 + 它自己的 caption），
+  不再只显示一行「［表情］…」文字；面板没开时也记着，下次打开补画。
+- 右键「发个表情」整条删掉：表情只从聊天面板的 😊 里发（`show_meme()` 代码入口保留）。
+- `桌宠.py` 按功能拆出三个文件：
+  - `llm_chat.py`：provider 配置 / 五个人设 / 请求体 / SSE / 流式请求；
+  - `meme_store.py`：meme-packs 只读索引、按 tag 抽图、缩放缓存；
+  - `chat_ui.py`：聊天面板、左右气泡、头像、表情抽屉（格子池 / 搜索 / 筛选）。
+  `桌宠.py` 继续 re-export 原来的常量 / 函数名，老测试不改也能跑；
+  `make_zip.py` 和 `桌宠.spec` 的隐藏导入同步更新。
+- 实测：真模型 76 字回复在面板里 76 字全显示（头顶气泡 75 字）；
+  点表情后聊天记录出现「图片卡 + caption」两条（我发 / 她回），高度按图片自适应。
+- 实测：`_work/test_meme_picker.py` **91 项**、`_work/test_chat.py` **79 项**、
+  `_work/test_meme.py` **55 项**全过；`_work/probe_qq_panel.py` 10 项全过。
+- 回归：test_anim 73、test_idle_mode 90、test_coin_cry 67、test_dance 35、
+  test_action_sfx 39、test_rice_shake 12、test_layer_menu 20、test_expr_question 34、
+  test_starry 33、test_walk_dir 17 全绿；四个 .py 编译通过。
+
 ### 聊天面板换成 QQ 风：粉彩天空 + 左右气泡 + 头像
 
 - 面板不再是纯输入框：**420×346**，上面是「小鲸鱼娘 / 温柔 · 在线」标题区，
