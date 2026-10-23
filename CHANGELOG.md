@@ -2,6 +2,25 @@
 
 ## v1.1.6（未发布）
 
+### 聊天面板修整：表情缩略图 / 可拖动 / 不跳位 / 不占头顶气泡 / 滚动更顺
+
+- 表情抽屉的缩略图恢复正常：拆模块时 `QImageReader` / `QImage` 没带进 `chat_ui.py`，
+  解码异常被吞掉，所有格子都显示成「?」；补上 import 后 25 张可见图都能出来。
+- 聊天窗口可以按住标题区拖动；拖过之后不再自动跟着桌宠跑（重开面板恢复跟随）。
+- 点 😊 展开表情抽屉时保持面板顶部，不再因为"下面放不下"突然翻到桌宠下方。
+- 聊天内容只进聊天面板：头顶气泡不再出现「嗯…我想想」、回复正文、兜底台词或断线提示。
+- 聊天记录滚动去掉每行的 `QGraphicsDropShadowEffect` 发光（40 行一起滚动太重）；
+  气泡改用渐变 + 边框。实测 40 条记录、31 次滚动共 36.7ms，约 **1.18ms/步**。
+- 我发的表情只显示图片，不再在图片下面写它的 caption 解释；她回的仍带 caption。
+- 界面继续向 `modern_chat_interface.html` 靠：标题头像 + 「桌面小鲸鱼」身份小牌、
+  「今天」分割线、每条消息下面有时间（HH:MM）。
+- 实测：`_work/test_meme_picker.py` **98 项**、`_work/test_chat.py` **71 项**、
+  `_work/test_meme.py` **55 项**全过；真机 `_work/probe_qq_panel.py` **15 项**全过
+  （含缩略图非空、拖动、展开不跳位、聊天不进气泡、我发表情无 caption）。
+- 回归：test_anim 73、test_idle_mode 90、test_coin_cry 67、test_dance 35、
+  test_action_sfx 39、test_rice_shake 12、test_layer_menu 20、test_expr_question 34、
+  test_starry 33、test_walk_dir 17 全绿。
+
 ### 聊天界面按 modern_chat_interface 重做；表情包直接进聊天记录；代码拆成几个文件
 
 - 聊天面板换成白玻璃 / 浅灰底 + 靛紫高光（照 `modern_chat_interface.html` 的感觉）：

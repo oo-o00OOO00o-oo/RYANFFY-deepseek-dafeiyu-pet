@@ -1,5 +1,45 @@
 # 待办（按版本记录）
 
+## v1.1.6 追加（2026-10-23：聊天面板修整 + 表情图显示）
+
+用户反馈：
+> 1.点那个小小表情时，出现的表情包浏览，表情包无法正常显示，聊天窗口无法挪动，点击发表情包界面在桌宠头上时就会为了避免遮挡桌宠而突然显示到桌宠下方
+> 2.你还是像素级复刻吧，现在这个很简陋
+> 3.桌宠的气泡就不要出现聊天室发的内容
+> 4.聊天记录往上翻时非常卡
+> 5.发表情包：我发不用显示在表情包下发这句话所代表的意思
+
+- **表情格子显示成「?」**：拆分 `chat_ui.py` 时漏了 `QImageReader` / `QImage` 两个 import，
+  `MemeThumbCache._decode()` 抛 `NameError` 被 `except Exception` 吞掉，全部返回 None。
+  已补 import，并在 `test_meme_picker` 加「格子缩略图真的解码出来了（不是 ?）」断言。
+- **面板拖动**：`ChatPanel` 标题区（y ≤ 58）按下拖动，`_pinned=True`；
+  `tick_follow()` 对 pinned 不再 `_place`，重开面板清掉 pinned。标题/头像/身份牌设
+  `WA_TransparentForMouseEvents`，事件落到面板本身。
+- **展开抽屉不跳位**：`tick_follow()` 改成 `_place(keep_top=self._drawer_open or self._pinned)`；
+  展开时保持顶部，只在超出屏幕时向上 clamp，不再翻到桌宠下方。
+- **聊天不进头顶气泡**：删掉 `send_chat` 的占位台词、`_chat_on_chunk` 的气泡增高、
+  `_chat_on_done` 的截断/打字机、错误/断线的气泡兜底；`_chat_tick()` 只 drain 队列。
+  聊天全文只写 `_chat_ui_log` / 面板。`CHAT_TYPE_CPS`、`_chat_fit_display` 等暂留未用。
+- **滚动卡**：去掉每行的 `QGraphicsDropShadowEffect`（用户气泡/图片卡各一个，40 行很重）；
+  用渐变 + 边框替代。实测 40 条、31 次滚动 36.7ms（1.18ms/步）。
+- **我发的表情不显示 caption**：`send_meme` 里改成 `chat_ui_add("user", "", image=path)`；
+  图片卡 caption 为空时隐藏 label。她回的仍写 caption。
+- **更像 HTML**：标题头像 40×40 + 「桌面小鲸鱼」身份小牌；「今天」分割线；
+  每条消息下 `HH:MM` 时间；底部药丸输入 + 圆形 ➤。
+- **测试**：`test_meme_picker` 98（拖动状态、展开不跳位、缩略图非空、用户图片无 caption）、
+  `test_chat` 71（改为验证聊天不进气泡、记录里有全文/兜底/断线）、
+  `test_meme` 55；真机 `probe_qq_panel.py` 15 项。
+- **已知 / 可再做**：
+  - 「像素级复刻」目前做到结构/配色/圆角/头像/时间/分割线；Qt 没有 CSS backdrop-blur，
+    也没有真实投影（面板自绘阴影会超出窗口），所以玻璃感和 shadow-2xl 只能近似。
+  - 没做左侧 attachment / 麦克风 / call / video 图标（没有对应功能，不想放假按钮）。
+  - 拖动真机探针用合成 QMouseEvent，物理鼠标拖动建议手动再试一次。
+  - 图片卡仍是缩略图，点图没有大图预览；40 行记录上限、内存记录。
+  - 聊天不再进头顶气泡后，面板关着时用户看不见回复，只能重开面板看记录。
+  - `CHAT_TYPE_CPS` / `CHAT_BUBBLE_H` / `_chat_fit_display` 等成了未用代码，
+    下次清理时再删（这次先不动，避免误伤）。
+  - 拆分后打包仍未实测（本机无 PyInstaller）。
+
 ## v1.1.6 追加（2026-10-23：按 modern_chat_interface 重做 + 拆文件）
 
 需求：照着 `C:\Users\16050\Downloads\modern_chat_interface.html` 写聊天界面；
