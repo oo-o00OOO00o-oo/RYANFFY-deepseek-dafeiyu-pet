@@ -44,13 +44,14 @@ from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QUrl, QI
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
                            QPolygonF, QImage, QImageReader, QCursor, QMouseEvent,
                            QKeySequence, QPen, QPalette, QPainterPath,
-                           QLinearGradient, QActionGroup)
+                           QLinearGradient, QActionGroup, QTextDocument)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton,
                                QSlider, QWidgetAction, QFileDialog, QListWidget,
                                QListWidgetItem, QLabel, QFileIconProvider, QSizePolicy,
-                               QComboBox, QScrollArea, QTextEdit)
+                               QComboBox, QScrollArea, QTextEdit,
+                               QGraphicsDropShadowEffect)
 
 try:
     from PySide6.QtMultimedia import QSoundEffect
@@ -4765,13 +4766,15 @@ def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
 # 面板是无边框置顶小窗：星空底 + 一行输入；点 😊 往下展开一块表情网格（5 列）。
 # 网格只在 paintEvent 里解码"可见 + 上下各预取 1 行"的缩略图，缓存 LRU 80 张 ——
 # 434 张图一次性解码会卡住界面好几秒，这条是硬约束。
-CHAT_PANEL_W = 360
-CHAT_PANEL_H = 104
+CHAT_PANEL_W = 420
+CHAT_HEADER_H = 58
+CHAT_LOG_H = 210
+CHAT_PANEL_H = CHAT_HEADER_H + CHAT_LOG_H + 78   # 346
 CHAT_DRAWER_H = 320
-CHAT_ROW_Y = 20
+CHAT_ROW_Y = CHAT_HEADER_H + CHAT_LOG_H + 8      # 276
 CHAT_INPUT_H = 62
 CHAT_ROW_H = 34
-CHAT_RADIUS = 16
+CHAT_RADIUS = 20
 MEME_GRID_COLS = 5
 MEME_CELL = 62
 MEME_GRID_GAP = 6
@@ -4779,42 +4782,55 @@ MEME_GRID_LIMIT = 200            # 一次最多渲染 200 个格子（再多也�
 MEME_THUMB_CACHE_MAX = 80        # 缩略图 LRU 上限
 MEME_GRID_W = MEME_GRID_COLS * MEME_CELL + (MEME_GRID_COLS - 1) * MEME_GRID_GAP
 
-_PANEL_FG = QColor(232, 236, 255)
-_PANEL_DIM = QColor(168, 176, 210)
-_PANEL_CELL_BG = QColor(14, 16, 38, 205)
-_PANEL_CELL_HOVER = QColor(150, 168, 248, 190)
+_PANEL_FG = QColor(74, 59, 90)
+_PANEL_DIM = QColor(138, 120, 160)
+_PANEL_CELL_BG = QColor(255, 255, 255, 120)
+_PANEL_CELL_HOVER = QColor(80, 220, 250, 230)
 
 _CHAT_INPUT_QSS = (
-    "QLineEdit, QTextEdit { background: rgba(8, 10, 28, 120);"
-    " border: 1px solid rgba(150, 168, 248, 60); border-radius: 9px;"
-    " color: #E8ECFF; padding-left: 8px; padding-right: 8px;"
-    " selection-background-color: #46558f; }"
-    "QLineEdit:focus, QTextEdit:focus { border: 1px solid rgba(150, 168, 248, 150); }"
+    "QLineEdit, QTextEdit { background: rgba(255, 255, 255, 165);"
+    " border: 1px solid rgba(206, 184, 232, 190); border-radius: 12px;"
+    " color: #4A3B5A; padding-left: 9px; padding-right: 9px;"
+    " selection-background-color: #9BE9F7; }"
+    "QLineEdit:focus, QTextEdit:focus { border: 1px solid rgba(112, 210, 238, 230); }"
     "QTextEdit QScrollBar:vertical { background: transparent; width: 5px; margin: 0; }"
-    "QTextEdit QScrollBar::handle:vertical { background: rgba(150, 168, 248, 90);"
+    "QTextEdit QScrollBar::handle:vertical { background: rgba(170, 140, 210, 110);"
     " border-radius: 2px; min-height: 18px; }"
     "QTextEdit QScrollBar::add-line:vertical, QTextEdit QScrollBar::sub-line:vertical"
     " { height: 0; }")
 _CHAT_BTN_QSS = (
-    "QToolButton { background: rgba(255, 255, 255, 14);"
-    " border: 1px solid rgba(150, 168, 248, 65); border-radius: 9px;"
-    " color: #E8ECFF; padding: 0px; }"
-    "QToolButton:hover { background: rgba(150, 168, 248, 60); }"
-    "QToolButton:pressed { background: rgba(150, 168, 248, 100); }")
+    "QToolButton { background: rgba(255, 255, 255, 150);"
+    " border: 1px solid rgba(206, 184, 232, 190); border-radius: 12px;"
+    " color: #5A4368; padding: 0px; }"
+    "QToolButton:hover { background: rgba(255, 255, 255, 220); }"
+    "QToolButton:pressed { background: rgba(218, 238, 255, 240); }")
 _CHAT_SEND_QSS = (
-    "QToolButton { background: rgba(92, 112, 205, 175);"
-    " border: 1px solid rgba(150, 168, 248, 120); border-radius: 9px;"
-    " color: #F2F5FF; padding: 0px; }"
-    "QToolButton:hover { background: rgba(120, 142, 235, 210); }"
-    "QToolButton:pressed { background: rgba(150, 168, 248, 160); }")
+    "QToolButton { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+    " stop:0 #6FE7F5, stop:1 #4FC3F7);"
+    " border: 1px solid rgba(90, 205, 235, 220); border-radius: 12px;"
+    " color: #0B3440; padding: 0px; }"
+    "QToolButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+    " stop:0 #8CF0FB, stop:1 #6FD3FF); }"
+    "QToolButton:pressed { background: #3FB4E8; }")
 _CHAT_SCROLL_QSS = (
     "QScrollArea { background: transparent; border: none; }"
     "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
-    "QScrollBar::handle:vertical { background: rgba(150, 168, 248, 90);"
+    "QScrollBar::handle:vertical { background: rgba(170, 140, 210, 120);"
     " border-radius: 3px; min-height: 28px; }"
-    "QScrollBar::handle:vertical:hover { background: rgba(150, 168, 248, 150); }"
+    "QScrollBar::handle:vertical:hover { background: rgba(112, 210, 238, 200); }"
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
     "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }")
+
+# 聊天记录里的两种气泡（左：她，右：我）
+_PET_BUBBLE_QSS = (
+    "QLabel { background: rgba(255, 255, 255, 232);"
+    " border: 1px solid rgba(206, 184, 232, 210);"
+    " border-radius: 14px; color: #4A3B5A; padding: 8px 11px; }")
+_USER_BUBBLE_QSS = (
+    "QLabel { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+    " stop:0 #7FEBF7, stop:1 #5BC8F5);"
+    " border: 1px solid rgba(255, 255, 255, 190);"
+    " border-radius: 14px; color: #0B3440; padding: 8px 11px; }")
 
 
 def smiley_pixmap(size=22):
@@ -5159,8 +5175,126 @@ class ChatInput(QTextEdit):
         super().keyPressEvent(ev)
 
 
+_PET_AVATAR_CACHE = []
+
+
+def pet_avatar_pixmap(size=36):
+    """聊天记录里她的小头像：从现有正面立绘裁一个 round 头像，不额外加素材。"""
+    size = int(size)
+    if _PET_AVATAR_CACHE and _PET_AVATAR_CACHE[0].width() == size:
+        return _PET_AVATAR_CACHE[0]
+    path = (sprite_file("正面_238") or sprite_file("正面_306")
+            or sprite_file("正面") or "")
+    pm = QPixmap(path) if path else QPixmap()
+    if pm.isNull():
+        return None
+    # 只取头部那一块（整只 chibi 塞进圆头像会太小），再等比缩放到头像大小
+    side = max(1, min(pm.width(), int(pm.height() * 0.62)))
+    x = max(0, (pm.width() - side) // 2)
+    y = max(0, int(pm.height() * 0.03))
+    pm = pm.copy(x, y, side, side)
+    pm = pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                   Qt.TransformationMode.SmoothTransformation)
+    x = max(0, (pm.width() - size) // 2)
+    y = max(0, (pm.height() - size) // 2)
+    pm = pm.copy(x, y, min(size, pm.width()), min(size, pm.height()))
+    _PET_AVATAR_CACHE[:] = [pm]
+    return pm
+
+
+class AvatarWidget(QWidget):
+    """圆形头像：她 = 现有立绘；我 = 粉蓝渐变 + 「你」。"""
+
+    def __init__(self, role, size=36, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self._size = int(size)
+        self.setFixedSize(self._size, self._size)
+        self._pm = pet_avatar_pixmap(self._size) if role == "pet" else None
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        rect = QRectF(1, 1, self._size - 2, self._size - 2)
+        path = QPainterPath()
+        path.addEllipse(rect)
+        p.setClipPath(path)
+        if self._pm is not None and not self._pm.isNull():
+            p.fillPath(path, QColor(255, 236, 246))
+            p.drawPixmap(0, 0, self._pm)
+        else:
+            grad = QLinearGradient(0, 0, self._size, self._size)
+            grad.setColorAt(0.0, QColor(255, 190, 224))
+            grad.setColorAt(1.0, QColor(120, 226, 247))
+            p.fillPath(path, grad)
+            f = QFont(self.font())
+            f.setPointSizeF(10.5)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor(70, 55, 85))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "你")
+        p.setClipping(False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        p.drawEllipse(rect)
+        p.end()
+
+
+class ChatMessageRow(QWidget):
+    """聊天记录的一行：左边她（白/粉气泡）、右边我（青色发光气泡）+ 圆头像。"""
+
+    def __init__(self, role, text, font, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.avatar = AvatarWidget(role, 36, self)
+        self.label = QLabel(str(text or ""), self)
+        self.label.setWordWrap(True)
+        f = QFont(font)
+        f.setPointSizeF(10.5)
+        self.label.setFont(f)
+        self.label.setStyleSheet(_PET_BUBBLE_QSS if role == "pet" else _USER_BUBBLE_QSS)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        if role == "user":
+            glow = QGraphicsDropShadowEffect(self.label)
+            glow.setBlurRadius(20)
+            glow.setOffset(0, 0)
+            glow.setColor(QColor(80, 220, 255, 210))
+            self.label.setGraphicsEffect(glow)
+        self._bw, self._bh = self._measure(str(text or ""), f)
+        self.label.setFixedSize(self._bw, self._bh)
+        self.setFixedHeight(max(36, self._bh) + 8)
+        self._place()
+
+    @staticmethod
+    def _measure(text, font):
+        fm = QFontMetrics(font)
+        max_w = 262
+        if not text:
+            return 70, fm.height() + 22
+        text_w = min(max_w, fm.horizontalAdvance(text) + 44)
+        text_w = max(92, text_w)
+        doc = QTextDocument()
+        doc.setDefaultFont(font)
+        doc.setPlainText(text)
+        doc.setTextWidth(max(20, text_w - 26))
+        return text_w, int(doc.size().height()) + 22
+
+    def _place(self):
+        if self.role == "pet":
+            self.avatar.move(4, 4)
+            self.label.move(48, 4)
+        else:
+            self.avatar.move(max(4, self.width() - 40), 4)
+            self.label.move(max(4, self.width() - 46 - self._bw), 4)
+
+    def resizeEvent(self, ev):
+        self._place()
+        super().resizeEvent(ev)
+
+
 class ChatPanel(QWidget):
-    """星空风聊天面板：一行输入 + 😊 展开的表情抽屉（非模态，不阻塞主循环）。"""
+    """QQ 风聊天面板：粉彩天空 + 左右消息气泡 + 头像 + 😊 表情抽屉（非模态）。"""
 
     def __init__(self, pet):
         super().__init__(None, Qt.WindowType.FramelessWindowHint
@@ -5186,9 +5320,32 @@ class ChatPanel(QWidget):
 
     # ---------- 界面 ----------
     def _build_ui(self):
-        self._persona = QLabel("温柔", self)
-        self._persona.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._title = QLabel("小鲸鱼娘", self)
+        self._title.setStyleSheet("background: transparent; color: #5A4368;")
+        self._title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self._persona = QLabel("温柔 · 在线", self)
+        self._persona.setStyleSheet("background: transparent; color: #8A78A0;")
         self._persona.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        # 聊天记录（左她右我）
+        self._log_scroll = QScrollArea(self)
+        self._log_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._log_scroll.setWidgetResizable(True)
+        self._log_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._log_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._log_scroll.setStyleSheet(_CHAT_SCROLL_QSS)
+        self._log_scroll.viewport().setAutoFillBackground(False)
+        self._log_body = QWidget()
+        self._log_body.setAutoFillBackground(False)
+        self._log_body.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._log_lay = QVBoxLayout(self._log_body)
+        self._log_lay.setContentsMargins(2, 2, 2, 2)
+        self._log_lay.setSpacing(8)
+        self._log_lay.addStretch(1)
+        self._log_scroll.setWidget(self._log_body)
+        self._log_rows = []
+        self._typing_row = None
 
         self._input = ChatInput(self)
         self._input.setPlaceholderText("跟小鲸鱼娘说点什么…")
@@ -5202,6 +5359,7 @@ class ChatPanel(QWidget):
         self._meme_btn.setIconSize(QSize(22, 22))
         self._meme_btn.setToolTip("表情")
         self._meme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._meme_btn.setStyleSheet(_CHAT_BTN_QSS)
         self._meme_btn.clicked.connect(self.toggle_drawer)
 
         self._send_btn = QToolButton(self)
@@ -5215,6 +5373,7 @@ class ChatPanel(QWidget):
         self._close_btn.setText("×")
         self._close_btn.setToolTip("关闭（Esc）")
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(_CHAT_BTN_QSS)
         self._close_btn.clicked.connect(self.close_panel)
 
         # 表情抽屉
@@ -5227,6 +5386,7 @@ class ChatPanel(QWidget):
         self._filter_btn = QToolButton(self)
         self._filter_btn.setText("筛选 ▾")
         self._filter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter_btn.setStyleSheet(_CHAT_BTN_QSS)
         self._filter_btn.clicked.connect(self._show_filter_menu)
         self._filter_actions = {}
         self._filter_menu = QMenu(self)
@@ -5241,7 +5401,7 @@ class ChatPanel(QWidget):
             self._filter_actions[tag] = act
 
         self._count = QLabel("共 0 张", self)
-        self._count.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._count.setStyleSheet("background: transparent; color: #6E5A86;")
         self._count.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self._scroll = QScrollArea(self)
@@ -5268,20 +5428,20 @@ class ChatPanel(QWidget):
         self._footer_visible = False
 
         self._footer = QLabel("", self)
-        self._footer.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._footer.setStyleSheet("background: transparent; color: #6E5A86;")
         self._footer.setWordWrap(True)
         self._footer.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self._empty_label = QLabel("没找到这类表情", self)
-        self._empty_label.setStyleSheet("background: transparent; color: #A8B0D2;")
+        self._empty_label.setStyleSheet("background: transparent; color: #6E5A86;")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_btn = QPushButton("清空筛选", self)
         self._empty_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._empty_btn.setStyleSheet(
-            "QPushButton { background: rgba(150, 168, 248, 55);"
-            " border: 1px solid rgba(150, 168, 248, 100); border-radius: 8px;"
-            " color: #E8ECFF; padding: 4px 10px; }"
-            "QPushButton:hover { background: rgba(150, 168, 248, 95); }")
+            "QPushButton { background: rgba(255, 255, 255, 170);"
+            " border: 1px solid rgba(206, 184, 232, 210); border-radius: 9px;"
+            " color: #5A4368; padding: 4px 10px; }"
+            "QPushButton:hover { background: rgba(255, 255, 255, 235); }")
         self._empty_btn.clicked.connect(self._clear_filters)
 
         self._search_timer = QTimer(self)
@@ -5289,10 +5449,10 @@ class ChatPanel(QWidget):
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._refresh)
 
-        # placeholder 在深色底上要亮一点（QSS 的 color 管不到 placeholder）
+        # placeholder 在浅色底上要压暗一点（QSS 的 color 管不到 placeholder）
         for edit in (self._input, self._search):
             pal = edit.palette()
-            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(168, 176, 210, 175))
+            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(150, 132, 172, 190))
             edit.setPalette(pal)
 
         # 抽屉关着时先把这些收起来
@@ -5303,13 +5463,93 @@ class ChatPanel(QWidget):
         return (self._search, self._filter_btn, self._count, self._scroll,
                 self._footer, self._empty_label, self._empty_btn)
 
+    # ---------- 聊天记录（左她 / 右我） ----------
+    def _clear_log_rows(self):
+        for row in list(self._log_rows):
+            try:
+                row.setParent(None)
+                row.deleteLater()
+            except Exception:
+                pass
+        self._log_rows = []
+        if self._typing_row is not None:
+            try:
+                self._typing_row.setParent(None)
+                self._typing_row.deleteLater()
+            except Exception:
+                pass
+            self._typing_row = None
+
+    def _scroll_log_bottom(self):
+        bar = self._log_scroll.verticalScrollBar()
+
+        def go():
+            try:
+                bar.setValue(bar.maximum())
+            except Exception:
+                pass
+
+        # 布局还没算完时 maximum 还是 0：隔一帧、40ms 各补一次，保证停在最新一条
+        QTimer.singleShot(0, go)
+        QTimer.singleShot(40, go)
+
+    def add_message(self, role, text):
+        row = ChatMessageRow(role, text, self.pet.bubble_font, self._log_body)
+        self._log_lay.insertWidget(self._log_lay.count() - 1, row)
+        self._log_rows.append(row)
+        while len(self._log_rows) > 40:
+            old = self._log_rows.pop(0)
+            try:
+                old.setParent(None)
+                old.deleteLater()
+            except Exception:
+                pass
+        if self._typing_row is not None:      # 「正在输入…」永远排最后
+            self._log_lay.removeWidget(self._typing_row)
+            self._log_lay.insertWidget(self._log_lay.count() - 1, self._typing_row)
+        self._scroll_log_bottom()
+        return row
+
+    def set_log(self, messages):
+        self._clear_log_rows()
+        for item in list(messages or [])[-40:]:
+            try:
+                role, text = item.get("role"), item.get("text")
+            except AttributeError:
+                continue
+            if role in ("pet", "user") and text:
+                row = ChatMessageRow(role, text, self.pet.bubble_font, self._log_body)
+                self._log_lay.insertWidget(self._log_lay.count() - 1, row)
+                self._log_rows.append(row)
+        self._scroll_log_bottom()
+
+    def set_typing(self, on):
+        if on:
+            if self._typing_row is None:
+                self._typing_row = ChatMessageRow(
+                    "pet", "正在输入…", self.pet.bubble_font, self._log_body)
+                self._log_lay.insertWidget(self._log_lay.count() - 1,
+                                          self._typing_row)
+                self._scroll_log_bottom()
+        elif self._typing_row is not None:
+            row, self._typing_row = self._typing_row, None
+            try:
+                row.setParent(None)
+                row.deleteLater()
+            except Exception:
+                pass
+
     def _apply_fonts(self):
         base = QFont(self.pet.bubble_font) if getattr(self.pet, "bubble_font", None) \
             else QFont()
-        base.setPointSize(11)
+        base.setPointSizeF(11.5)
         self._input.setFont(base)
         f_small = QFont(base)
         f_small.setPointSizeF(9.0)
+        f_title = QFont(base)
+        f_title.setPointSizeF(16.0)
+        f_title.setBold(True)
+        self._title.setFont(f_title)
         self._persona.setFont(f_small)
         f_search = QFont(base)
         f_search.setPointSizeF(9.5)
@@ -5322,31 +5562,34 @@ class ChatPanel(QWidget):
         self._empty_label.setFont(f_small)
         self._empty_btn.setFont(f_small)
         f_close = QFont(f_small)
-        f_close.setPointSizeF(13.0)
+        f_close.setPointSizeF(15.0)
         self._close_btn.setFont(f_close)
 
     def _relayout(self):
         w = self.width()
-        self._close_btn.setGeometry(w - 30, 4, 22, 22)
-        self._persona.setGeometry(14, CHAT_ROW_Y + 22, 42, 18)
+        self._title.setGeometry(18, 8, 240, 27)
+        self._persona.setGeometry(18, 35, 240, 17)
+        self._close_btn.setGeometry(w - 32, 9, 22, 22)
+        self._log_scroll.setGeometry(10, CHAT_HEADER_H, w - 20, CHAT_LOG_H)
         emoji_x = w - 10 - 44 - 6 - 30
         self._meme_btn.setGeometry(emoji_x, CHAT_ROW_Y + 14, 30, CHAT_ROW_H)
         self._send_btn.setGeometry(w - 10 - 44, CHAT_ROW_Y + 14, 44, CHAT_ROW_H)
-        self._input.setGeometry(60, CHAT_ROW_Y, max(60, emoji_x - 6 - 60),
+        self._input.setGeometry(14, CHAT_ROW_Y, max(60, emoji_x - 6 - 14),
                                 CHAT_INPUT_H)
+        # 表情抽屉（面板向下展开的那一块）
         search_y = CHAT_PANEL_H + 10
-        self._search.setGeometry(10, search_y, 196, 28)
-        self._filter_btn.setGeometry(212, search_y, 72, 28)
-        self._count.setGeometry(290, search_y, 60, 28)
+        self._search.setGeometry(14, search_y, 230, 28)
+        self._filter_btn.setGeometry(250, search_y, 80, 28)
+        self._count.setGeometry(336, search_y, 70, 28)
         scroll_y = search_y + 36
         footer_visible = bool(self._footer_visible)
         scroll_h = CHAT_PANEL_H + CHAT_DRAWER_H - 10 - scroll_y
         if footer_visible:
             scroll_h -= 22
-        self._scroll.setGeometry(10, scroll_y, 340, scroll_h)
-        self._footer.setGeometry(10, scroll_y + scroll_h + 2, 340, 18)
-        self._empty_label.setGeometry(10, scroll_y + 70, 340, 24)
-        self._empty_btn.setGeometry(10 + 124, scroll_y + 108, 92, 30)
+        self._scroll.setGeometry(14, scroll_y, w - 28, scroll_h)
+        self._footer.setGeometry(14, scroll_y + scroll_h + 2, w - 28, 18)
+        self._empty_label.setGeometry(14, scroll_y + 70, w - 28, 24)
+        self._empty_btn.setGeometry(14 + (w - 28 - 92) // 2, scroll_y + 108, 92, 30)
         if getattr(self, "_grid", None) is not None:
             self._grid.sync_pool()
 
@@ -5365,10 +5608,11 @@ class ChatPanel(QWidget):
         font_sig = str(getattr(self.pet, "bubble_font_key", ""))
         if name != self._persona_cache:
             self._persona_cache = name
-            self._persona.setText(name)
+            self._persona.setText(name + " · 在线")
         if font_sig != self._font_sig:
             self._font_sig = font_sig
             self._apply_fonts()
+            self.set_log(getattr(self.pet, "_chat_ui_log", []))
 
     def show_panel(self):
         self.refresh_persona()
@@ -5381,6 +5625,10 @@ class ChatPanel(QWidget):
             self.show()
         else:
             self._apply_height()
+        self.set_log(getattr(self.pet, "_chat_ui_log", []))
+        if not self._log_rows:
+            self.add_message("pet", "主人，今天想聊点什么呀？")
+        self.set_typing(bool(getattr(self.pet, "_chat_ui_typing", False)))
         if self._drawer_open:
             self._refresh()
             self._search.setFocus()
@@ -5559,12 +5807,41 @@ class ChatPanel(QWidget):
 
     # ---------- 绘制 ----------
     def paintEvent(self, _ev):
+        """粉彩天空 + 云朵 + 圆角描边（半透明），头图区域压一层白。"""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(rect, CHAT_RADIUS, CHAT_RADIUS)
-        paint_starry_bubble(p, path, rect)
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor(255, 226, 243, 242))
+        grad.setColorAt(0.55, QColor(241, 226, 255, 240))
+        grad.setColorAt(1.0, QColor(211, 238, 255, 242))
+        p.fillPath(path, grad)
+        p.save()
+        p.setClipPath(path)
+        w, h = float(self.width()), float(self.height())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 95))
+        for cx, cy, s in ((0.18, 0.20, 1.0), (0.70, 0.13, 0.82),
+                          (0.48, 0.46, 1.15), (0.84, 0.55, 0.72),
+                          (0.22, 0.68, 0.92)):
+            bx, by = w * cx - 70 * s, h * cy
+            p.drawEllipse(QRectF(bx, by, 76 * s, 28 * s))
+            p.drawEllipse(QRectF(bx + 22 * s, by - 11 * s, 46 * s, 32 * s))
+            p.drawEllipse(QRectF(bx - 10 * s, by + 7 * s, 42 * s, 24 * s))
+        p.setBrush(QColor(255, 255, 255, 135))
+        for fx, fy, fr in ((0.12, 0.42, 2.2), (0.33, 0.31, 1.6),
+                           (0.58, 0.24, 2.0), (0.78, 0.40, 1.5),
+                           (0.90, 0.30, 1.8), (0.47, 0.60, 1.4)):
+            p.drawEllipse(QPointF(w * fx, h * fy), fr, fr)
+        p.fillRect(QRectF(0, 0, w, CHAT_HEADER_H), QColor(255, 255, 255, 58))
+        p.restore()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(198, 176, 226, 225), 1.2))
+        p.drawPath(path)
+        p.setPen(QPen(QColor(255, 255, 255, 120), 1))
+        p.drawLine(QPointF(16, CHAT_HEADER_H - 1), QPointF(w - 16, CHAT_HEADER_H - 1))
         p.end()
 
     def resizeEvent(self, ev):
@@ -6328,7 +6605,9 @@ class PetWindow(QWidget):
         self._chat_typing = False         # 打字机还在跑
         self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
         self._chat_font_pt = None         # 长回复自动缩字号（让气泡不压到身上）
-        self._chat_panel = None           # 星空聊天面板（打开时创建，非模态）
+        self._chat_panel = None           # QQ 风聊天面板（打开时创建，非模态）
+        self._chat_ui_log = []            # 面板里的左右聊天记录（只在内存）
+        self._chat_ui_typing = False
         # 表情斗图：主人发一张 → 过一会儿她回一张
         self._meme_reply_timer = None
         self._meme_reply_tag = ""
@@ -11098,6 +11377,7 @@ class PetWindow(QWidget):
             self._meme_reply_timer.timeout.connect(self._meme_reply_now)
         delay = MEME_REPLY_DELAY_MS if reply_delay is None else max(0, int(reply_delay))
         self._meme_reply_timer.start(delay)
+        self.chat_ui_add("user", "［表情］" + (str(caption or "").strip() or "一张表情"))
         return True
 
     def _meme_reply_cancel(self):
@@ -11142,6 +11422,7 @@ class PetWindow(QWidget):
             return
         chat_debug("斗图：回一张 tag=%s" % (self._meme_tag_of(got[0]) or "?"))
         self.show_meme_path(got[0], got[1], seconds=MEME_SECONDS)
+        self.chat_ui_add("pet", "［表情］" + (str(got[1] or "").strip() or "一张表情"))
 
     def clear_meme(self, repaint=True):
         """收掉头顶的表情（点一下 / 到点 / 换一张都会走这里）。"""
@@ -11213,6 +11494,21 @@ class PetWindow(QWidget):
         name = str(self.cfg.get("chat_persona") or "")
         return name if name in CHAT_PERSONAS else CHAT_PERSONA_DEFAULT
 
+    def chat_ui_add(self, role, text):
+        """往聊天面板补一条记录（role=user / pet）。面板没开也先存着，打开时补画。"""
+        text = str(text or "").strip()
+        if not text:
+            return
+        self._chat_ui_log.append({"role": role, "text": text})
+        del self._chat_ui_log[:-60]
+        if self._chat_panel is not None:
+            self._chat_panel.add_message(role, text)
+
+    def chat_ui_typing(self, on):
+        self._chat_ui_typing = bool(on)
+        if self._chat_panel is not None:
+            self._chat_panel.set_typing(bool(on))
+
     def set_chat_persona(self, name):
         """右键「性格」里点了一项：写进 config.json，下一条消息生效（历史不动）。"""
         if name not in CHAT_PERSONAS:
@@ -11222,7 +11518,7 @@ class PetWindow(QWidget):
         self.say("好，我换成「%s」的性格啦" % name, seconds=2.2, again=True)
 
     def open_chat_dialog(self):
-        """右键「聊天…」：开星空聊天面板（原来的 QInputDialog 已经换掉）。
+        """右键「聊天…」：开 QQ 风聊天面板（原来的 QInputDialog 已经换掉）。
 
         名字保留是为了不动右键菜单那条 action；真正的窗口是 ChatPanel。
         """
@@ -11264,6 +11560,8 @@ class PetWindow(QWidget):
             target=self._chat_worker,
             args=(gen, provider, messages, cancel, text),
             daemon=True).start()
+        self.chat_ui_add("user", text)
+        self.chat_ui_typing(True)
         return True
 
     def _chat_cancel_previous(self):
@@ -11423,6 +11721,8 @@ class PetWindow(QWidget):
         self._trigger_until = max(float(self._trigger_until or 0.0),
                                   self.bubble_until)
         self._freeze_for_chat(int((remain + CHAT_HOLD_SEC) * 1000))
+        self.chat_ui_typing(False)
+        self.chat_ui_add("pet", full)      # 面板里给全文（头顶气泡才有长度限制）
         chat_debug("完成：%d 字（显示 %d），历史 %d 条"
                    % (len(full), len(self._chat_full), len(self._chat_history)))
 
@@ -11434,6 +11734,8 @@ class PetWindow(QWidget):
         self._chat_reset_state()
         self._set_bubble_h(BUBBLE_H)
         self._chat_show_text(CHAT_FALLBACK_LINE, CHAT_HOLD_SEC + 1.0)
+        self.chat_ui_typing(False)
+        self.chat_ui_add("pet", CHAT_FALLBACK_LINE)
 
     def _chat_on_disconnect(self):
         """流到一半断了：把已收到的部分留着，末尾补「…好像断线了」。"""
@@ -11442,14 +11744,16 @@ class PetWindow(QWidget):
         if not self._chat_full:
             self._chat_on_error("流式断开且没有收到内容")
             return
-        self._chat_full = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
-        self._chat_full, self._chat_font_pt = self._chat_fit_display(self._chat_full)
+        full_text = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
+        self._chat_full, self._chat_font_pt = self._chat_fit_display(full_text)
         self._chat_typing = True
         self._chat_started = True
         if self._chat_reveal_n > len(self._chat_full):
             self._chat_reveal_n = float(len(self._chat_full))
         remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
         self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
+        self.chat_ui_typing(False)
+        self.chat_ui_add("pet", full_text)
         self.update()
 
     def _chat_type_tick(self):
