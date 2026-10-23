@@ -6,16 +6,17 @@
 表情索引通过 `pet.meme_items()`（这样 monkeypatch 桌宠.MEME_ROOT 仍然生效）。
 """
 from collections import OrderedDict
+import datetime
 import math
 
 from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QSize,
                             Signal, QEvent)
-from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
-                           QPen, QPalette, QPainterPath, QLinearGradient,
-                           QTextDocument, QActionGroup)
+from PySide6.QtGui import (QPainter, QPixmap, QImage, QImageReader, QFont, QColor,
+                           QIcon, QFontMetrics, QPen, QPalette, QPainterPath,
+                           QLinearGradient, QTextDocument, QActionGroup)
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QToolButton, QLineEdit,
                                QScrollArea, QFrame, QVBoxLayout, QPushButton, QMenu,
-                               QTextEdit, QGraphicsDropShadowEffect)
+                               QTextEdit)
 
 from meme_store import MEME_TAGS
 
@@ -541,7 +542,7 @@ class ChatMessageRow(QWidget):
     """
 
     def __init__(self, role, text, font, parent=None, avatar_pm=None,
-                 image=None):
+                 image=None, timestamp=""):
         super().__init__(parent)
         self.role = role
         self.image = image
@@ -560,20 +561,28 @@ class ChatMessageRow(QWidget):
             self.label.setAlignment(Qt.AlignmentFlag.AlignLeft
                                     | Qt.AlignmentFlag.AlignVCenter)
             self.bubble = self.label
-            if role == "user":
-                self._add_glow(self.label)
             self._bw, self._bh = self._measure(str(text or ""), f)
             self.label.setFixedSize(self._bw, self._bh)
-        self.setFixedHeight(max(36, self._bh) + 8)
+        self._time_h = 0
+        self.time_label = QLabel(str(timestamp or ""), self)
+        f_time = QFont(f)
+        f_time.setPointSizeF(8.0)
+        self.time_label.setFont(f_time)
+        self.time_label.setStyleSheet(
+            "background: transparent; color: #94A3B8; border: none;")
+        if timestamp:
+            self._time_h = 14
+            self.time_label.show()
+        else:
+            self.time_label.hide()
+        self.setFixedHeight(max(36, self._bh + self._time_h + 4) + 8)
         self._place()
 
     @staticmethod
     def _add_glow(widget):
-        glow = QGraphicsDropShadowEffect(widget)
-        glow.setBlurRadius(22)
-        glow.setOffset(0, 0)
-        glow.setColor(QColor(99, 102, 241, 170))
-        widget.setGraphicsEffect(glow)
+        # 曾经用 QGraphicsDropShadowEffect 做发光；40 行一起滚动时太重（用户反馈很卡），
+        # 现在只用渐变 + 边框，效果差一点但滚动顺。
+        return
 
     def _build_image_row(self, role, caption, font):
         pm = chat_image_pixmap(self.image)
@@ -623,8 +632,6 @@ class ChatMessageRow(QWidget):
         self.container.setFixedSize(box_w, box_h)
         self.bubble = self.container
         self._bw, self._bh = box_w, box_h
-        if role == "user":
-            self._add_glow(self.container)
 
     @staticmethod
     def _measure(text, font):
@@ -644,9 +651,15 @@ class ChatMessageRow(QWidget):
         if self.role == "pet":
             self.avatar.move(4, 4)
             self.bubble.move(48, 4)
+            self.time_label.move(48, 4 + self._bh + 2)
+            self.time_label.setGeometry(48, 4 + self._bh + 2, self._bw, 14)
+            self.time_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         else:
             self.avatar.move(max(4, self.width() - 40), 4)
-            self.bubble.move(max(4, self.width() - 46 - self._bw), 4)
+            bx = max(4, self.width() - 46 - self._bw)
+            self.bubble.move(bx, 4)
+            self.time_label.setGeometry(bx, 4 + self._bh + 2, self._bw, 14)
+            self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight)
 
     def resizeEvent(self, ev):
         self._place()
@@ -679,19 +692,35 @@ class ChatPanel(QWidget):
         self._last_pos = None
         self._persona_cache = ""
         self._font_sig = None
+        self._pinned = False
+        self._dragging = False
+        self._drag_off = None
         self._build_ui()
         self.resize(CHAT_PANEL_W, CHAT_PANEL_H)
         self._relayout()
 
     # ---------- 界面 ----------
     def _build_ui(self):
+        self._header_avatar = AvatarWidget("pet", 40, self, avatar_pm=self._avatar_pm)
+        self._header_avatar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
         self._title = QLabel("小鲸鱼娘", self)
         self._title.setStyleSheet("background: transparent; color: #0F172A;")
         self._title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._badge = QLabel("桌面小鲸鱼", self)
+        self._badge.setStyleSheet(
+            "background: rgba(238, 242, 255, 255); color: #4F46E5;"
+            " border: 1px solid rgba(199, 210, 254, 255); border-radius: 10px;"
+            " padding: 1px 7px;")
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         self._persona = QLabel("温柔 · 在线", self)
         self._persona.setStyleSheet("background: transparent; color: #059669;")
         self._persona.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._persona.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         # 聊天记录（左她右我）
         self._log_scroll = QScrollArea(self)
@@ -707,6 +736,12 @@ class ChatPanel(QWidget):
         self._log_lay = QVBoxLayout(self._log_body)
         self._log_lay.setContentsMargins(2, 2, 2, 2)
         self._log_lay.setSpacing(8)
+        self._date_label = QLabel("今天")
+        self._date_label.setStyleSheet(
+            "background: rgba(226, 232, 240, 210); color: #64748B;"
+            " border-radius: 10px; padding: 2px 10px;")
+        self._date_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._log_lay.addWidget(self._date_label, 0, Qt.AlignmentFlag.AlignHCenter)
         self._log_lay.addStretch(1)
         self._log_scroll.setWidget(self._log_body)
         self._log_rows = []
@@ -860,7 +895,8 @@ class ChatPanel(QWidget):
 
     def add_message(self, role, text, image=None):
         row = ChatMessageRow(role, text, self.pet.bubble_font, self._log_body,
-                             avatar_pm=self._avatar_pm, image=image)
+                             avatar_pm=self._avatar_pm, image=image,
+                             timestamp=datetime.datetime.now().strftime("%H:%M"))
         self._log_lay.insertWidget(self._log_lay.count() - 1, row)
         self._log_rows.append(row)
         while len(self._log_rows) > 40:
@@ -882,12 +918,13 @@ class ChatPanel(QWidget):
             try:
                 role, text = item.get("role"), item.get("text")
                 image = item.get("image")
+                stamp = item.get("time") or ""
             except AttributeError:
                 continue
             if role in ("pet", "user") and (text or image):
                 row = ChatMessageRow(role, text, self.pet.bubble_font,
                                      self._log_body, avatar_pm=self._avatar_pm,
-                                     image=image)
+                                     image=image, timestamp=stamp)
                 self._log_lay.insertWidget(self._log_lay.count() - 1, row)
                 self._log_rows.append(row)
         self._scroll_log_bottom()
@@ -934,11 +971,19 @@ class ChatPanel(QWidget):
         f_close = QFont(f_small)
         f_close.setPointSizeF(15.0)
         self._close_btn.setFont(f_close)
+        f_badge = QFont(f_small)
+        f_badge.setPointSizeF(8.5)
+        self._badge.setFont(f_badge)
+        f_date = QFont(f_small)
+        f_date.setPointSizeF(8.5)
+        self._date_label.setFont(f_date)
 
     def _relayout(self):
         w = self.width()
-        self._title.setGeometry(18, 8, 240, 27)
-        self._persona.setGeometry(18, 35, 240, 17)
+        self._header_avatar.setGeometry(14, 8, 40, 40)
+        self._title.setGeometry(66, 7, 126, 26)
+        self._badge.setGeometry(194, 10, 90, 21)
+        self._persona.setGeometry(66, 33, 240, 17)
         self._close_btn.setGeometry(w - 32, 9, 22, 22)
         self._log_scroll.setGeometry(10, CHAT_HEADER_H, w - 20, CHAT_LOG_H)
         emoji_x = w - 10 - 36 - 6 - 34
@@ -1012,6 +1057,7 @@ class ChatPanel(QWidget):
         self._search_timer.stop()
         if self.isVisible():
             self.hide()
+        self._pinned = False
         self._release_guard()
 
     def _release_guard(self):
@@ -1048,7 +1094,8 @@ class ChatPanel(QWidget):
             self.close_panel()
             return
         self.refresh_persona()
-        self._place(keep_top=False)
+        # 展开表情抽屉 / 手动拖过之后不再自动回到"桌宠上方"，免得一点 😊 就跳到下面
+        self._place(keep_top=self._drawer_open or self._pinned)
 
     def _place(self, keep_top=False):
         pet = self.pet
@@ -1174,6 +1221,32 @@ class ChatPanel(QWidget):
             self._refresh()
             return True
         return super().eventFilter(obj, ev)
+
+    # ---------- 拖动（整个标题区） ----------
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton \
+                and ev.position().y() <= CHAT_HEADER_H:
+            self._dragging = True
+            self._pinned = True              # 手动挪过之后就不再自动跟着桌宠跑
+            self._drag_off = (ev.globalPosition().toPoint()
+                              - self.frameGeometry().topLeft())
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging:
+            self.move(ev.globalPosition().toPoint() - self._drag_off)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
 
     # ---------- 绘制 ----------
     def paintEvent(self, _ev):

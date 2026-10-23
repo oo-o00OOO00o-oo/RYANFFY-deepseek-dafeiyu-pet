@@ -9920,8 +9920,8 @@ class PetWindow(QWidget):
             self._meme_reply_timer.timeout.connect(self._meme_reply_now)
         delay = MEME_REPLY_DELAY_MS if reply_delay is None else max(0, int(reply_delay))
         self._meme_reply_timer.start(delay)
-        self.chat_ui_add("user", str(caption or "").strip() or "一张表情",
-                         image=path)
+        # 我发的表情只出图，不再把 caption 的"意思"写在图片下面
+        self.chat_ui_add("user", "", image=path)
         return True
 
     def _meme_reply_cancel(self):
@@ -10055,7 +10055,8 @@ class PetWindow(QWidget):
         text = str(text or "").strip()
         if not text and not image:
             return
-        item = {"role": role, "text": text}
+        item = {"role": role, "text": text,
+                "time": datetime.now().strftime("%H:%M")}
         if image:
             item["image"] = str(image)
         self._chat_ui_log.append(item)
@@ -10106,12 +10107,10 @@ class PetWindow(QWidget):
         self._chat_cancel = cancel
         self._chat_reset_state()
         self._chat_busy = True
-        self._freeze_for_chat(8000)
         provider = llm_provider_config(self.cfg)
         history = list(self._chat_history)[-CHAT_HISTORY_MAX:]
         messages = build_chat_messages(self.chat_persona_name(), history, text)
-        # 先占住气泡（等模型那几秒也有话说）
-        self._chat_show_text(CHAT_THINKING_LINE, 60.0)
+        # 聊天内容只进聊天面板，不占头顶气泡（2026-10-23 用户要求）
         chat_debug("发送：provider=%s model=%s persona=%s 历史=%d 条"
                    % (provider.get("name"), provider.get("model"),
                       self.chat_persona_name(), len(history)))
@@ -10197,9 +10196,8 @@ class PetWindow(QWidget):
             q.put((gen, "error", "%s: %s" % (exc.__class__.__name__, exc)))
 
     def _chat_tick(self):
-        """每帧：先收后台结果，再推进打字机（放在 tick 最前面，各移动模式都生效）。"""
+        """每帧：把后台线程的结果收掉（聊天只更新面板，不占头顶气泡）。"""
         self._chat_drain()
-        self._chat_type_tick()
 
     def _chat_drain(self):
         """把后台线程的排队结果在主线程处理掉（非阻塞）。"""
@@ -10224,40 +10222,11 @@ class PetWindow(QWidget):
         if not piece:
             return
         if not self._chat_started:
-            # 第一段到了：把"嗯…我想想"换成真回复，从第 1 个字开始冒
             self._chat_started = True
             self._chat_full = ""
             self._chat_reveal_n = 0.0
-            self._set_bubble_h(CHAT_BUBBLE_H)     # 聊天用大气泡（窗口往上长）
         self._chat_full += piece
         self._chat_typing = True
-        # 游标不动：模型一次吐一大段也只按 40 字/秒慢慢冒（真·打字机）
-        self.bubble_until = max(float(self.bubble_until or 0.0), self._secs() + 2.0)
-        self.update()
-
-    def _chat_fit_display(self, text):
-        """把回复裁到加高后的气泡里：固定 11.5 磅、最多 10 行，不再缩成小字。
-
-        返回 (显示文本, 字号)。历史里仍保留完整回复。
-        """
-        text = str(text or "")
-        if not text:
-            return "", None
-        if len(text) > CHAT_REPLY_DISPLAY_MAX:
-            text = text[:CHAT_REPLY_DISPLAY_MAX - 1].rstrip() + "…"
-        f = QFont(self.bubble_font)
-        f.setPointSizeF(CHAT_FONT_PT)
-        fm = QFontMetrics(f)
-        max_w = min(248, self.width() - 10) - 26
-        if len(self._wrap_cjk(fm, text, max_w)) <= CHAT_MAX_LINES:
-            return text, CHAT_FONT_PT
-        prefix = ""
-        for ch in text:
-            trial = prefix + ch
-            if len(self._wrap_cjk(fm, trial, max_w)) > CHAT_MAX_LINES:
-                break
-            prefix = trial
-        return prefix.rstrip() + "…", CHAT_FONT_PT
 
     def _chat_on_done(self, user_text):
         self._chat_busy = False
@@ -10268,85 +10237,31 @@ class PetWindow(QWidget):
         self._chat_history.append({"role": "user", "content": str(user_text)})
         self._chat_history.append({"role": "assistant", "content": full})
         del self._chat_history[:-CHAT_HISTORY_MAX]     # 只留最近 6 轮
-        # 头顶气泡塞不下太长的回复：只裁显示（必要时缩字号），历史里留全文
-        display, display_pt = self._chat_fit_display(full)
-        self._chat_font_pt = display_pt
-        if display != self._chat_full:
-            self._chat_full = display
-            self._chat_reveal_n = min(self._chat_reveal_n, float(len(display)))
-            self.bubble_text = display[:max(1, int(self._chat_reveal_n))]
-        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
-        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
-        self._trigger_until = max(float(self._trigger_until or 0.0),
-                                  self.bubble_until)
-        self._freeze_for_chat(int((remain + CHAT_HOLD_SEC) * 1000))
         self.chat_ui_typing(False)
-        self.chat_ui_add("pet", full)      # 面板里给全文（头顶气泡才有长度限制）
-        chat_debug("完成：%d 字（显示 %d），历史 %d 条"
-                   % (len(full), len(self._chat_full), len(self._chat_history)))
+        self.chat_ui_add("pet", full)
+        chat_debug("完成：%d 字，历史 %d 条"
+                   % (len(full), len(self._chat_history)))
 
     def _chat_on_error(self, reason):
-        """连不上 / 非 200 / 解析失败：气泡里给兜底台词，日志记 WARN，不弹异常框。"""
+        """连不上 / 非 200 / 解析失败：只在聊天记录里给兜底台词，不占头顶气泡。"""
         chat_debug("聊天失败：%s" % reason, "WARN")
         self._chat_busy = False
         self._chat_typing = False
         self._chat_reset_state()
-        self._set_bubble_h(BUBBLE_H)
-        self._chat_show_text(CHAT_FALLBACK_LINE, CHAT_HOLD_SEC + 1.0)
         self.chat_ui_typing(False)
         self.chat_ui_add("pet", CHAT_FALLBACK_LINE)
 
     def _chat_on_disconnect(self):
-        """流到一半断了：把已收到的部分留着，末尾补「…好像断线了」。"""
+        """流到一半断了：已收到的部分 + 「…好像断线了」写进聊天记录。"""
         chat_debug("流式连接中途断开（已收到 %d 字）" % len(self._chat_full), "WARN")
         self._chat_busy = False
         if not self._chat_full:
             self._chat_on_error("流式断开且没有收到内容")
             return
         full_text = self._chat_full.rstrip() + CHAT_DISCONNECT_LINE
-        self._chat_full, self._chat_font_pt = self._chat_fit_display(full_text)
-        self._chat_typing = True
-        self._chat_started = True
-        if self._chat_reveal_n > len(self._chat_full):
-            self._chat_reveal_n = float(len(self._chat_full))
-        remain = max(0.0, (len(self._chat_full) - self._chat_reveal_n) / CHAT_TYPE_CPS)
-        self.bubble_until = self._secs() + remain + CHAT_HOLD_SEC
         self.chat_ui_typing(False)
         self.chat_ui_add("pet", full_text)
-        self.update()
-
-    def _chat_type_tick(self):
-        """打字机：每个 tick 往前推 CHAT_TYPE_CPS 个字，气泡收掉后归零。"""
-        if not self._chat_full:
-            return
-        n = len(self._chat_full)
-        if self._chat_reveal_n < n:
-            step = CHAT_TYPE_CPS * self.tick_ms / 1000.0
-            self._chat_reveal_n = min(float(n), self._chat_reveal_n + step)
-            shown = self._chat_full[:max(1, int(self._chat_reveal_n))]
-            if shown != self.bubble_text:
-                self.bubble_text = shown
-                self.update()
-            return
-        if self._chat_typing:
-            self._chat_typing = False
-        if self._chat_busy:
-            # 还在收流：两次 token 之间别让气泡过期（模型卡一下也不至于清屏）
-            self.bubble_until = max(float(self.bubble_until or 0.0),
-                                    self._secs() + 2.0)
-            return
-        if self._secs() >= self.bubble_until:
-            self._chat_clear()
-
-    def _chat_clear(self):
-        """气泡到点消失：聊天状态一起清空（下次再来从第 0 字开始）。"""
-        shown = (self._chat_full[:max(1, int(self._chat_reveal_n))]
-                 if self._chat_full else "")
-        if shown and self.bubble_text == shown:
-            self.bubble_text = ""
         self._chat_reset_state()
-        self._set_bubble_h(BUBBLE_H)
-        self.update()
 
     # ---------- 鼠标事件 ----------
     def _forward_mouse_to_menu(self, e):
