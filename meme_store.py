@@ -184,6 +184,43 @@ def pick_meme(tag=None, root=None):
     return None
 
 
+def search_or_pick_meme(tag=None, keyword=None, root=None):
+    """根据 tag 和 keyword 优先匹配表情包：
+    1. 如果给定了 keyword，优先在 items 的 (caption + " " + keywords) 中匹配；
+       - 若同时指定了 tag，优先在满足 tag 的子集中匹配；
+       - 若未在当前 tag 命中，在全库包含 keyword 的表情中匹配；
+    2. 如果未指定 keyword 或关键词未命中，退回到按 tag 随机抽图；
+    3. 如果 tag 也没有匹配，则在全库随机抽一张；
+    返回 (abs_path, caption) 或 None。
+    """
+    tag = str(tag or "").strip().lower()
+    keyword = str(keyword or "").strip().lower()
+
+    if keyword:
+        for force in (False, True):
+            try:
+                items = _meme_items(force=force, root=root)
+            except Exception:
+                items = []
+            usable = [it for it in items if os.path.isfile(it[0])]
+            if not usable:
+                continue
+
+            if tag:
+                tag_kw = [it for it in usable if it[1] == tag and (keyword in it[2].lower() or keyword in it[3].lower())]
+                if tag_kw:
+                    abs_path, _t, caption, _k = random.choice(tag_kw)
+                    return abs_path, caption
+
+            any_kw = [it for it in usable if (keyword in it[2].lower() or keyword in it[3].lower())]
+            if any_kw:
+                abs_path, _t, caption, _k = random.choice(any_kw)
+                return abs_path, caption
+            break
+
+    return pick_meme(tag=tag, root=root)
+
+
 def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
     """把表情缩放到 max_w × max_h 里（等比、保 alpha），按 (路径, 目标尺寸) 缓存。"""
     max_w, max_h = max(1, int(max_w)), max(1, int(max_h))
@@ -204,5 +241,3 @@ def load_meme_pixmap(path, max_w=MEME_MAX_W, max_h=MEME_MAX_H):
             _meme_pix_cache.pop(old, None)
     _meme_pix_cache[key] = pm
     return pm
-
-

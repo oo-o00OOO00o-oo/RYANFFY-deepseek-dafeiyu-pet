@@ -221,6 +221,7 @@ def sprite_file(name):
 
 ASSET_DIR = os.path.join(BUNDLE_DIR, "assets")     # 音效 + 小鲸鱼挂件形象
 CONFIG_PATH = os.path.join(USER_DIR, "config.json")
+CHAT_HISTORY_PATH = os.path.join(USER_DIR, "chat_history.json")
 
 # 新界面（设置窗口）：v1.1.0 起，菜单里的「打开设置…」开的是它。
 # 单独一个模块；万一它起不来，也绝不能拖垮桌宠本身 —— 老菜单照旧能用。
@@ -247,7 +248,7 @@ from llm_chat import (DEFAULT_LLM_PROVIDER, DEFAULT_LLM_PROVIDERS,
                       ChatError, ChatCancelled, ChatDisconnected,
                       merge_llm_providers, llm_provider_config,
                       chat_system_prompt, build_chat_messages,
-                      build_chat_payload, parse_sse_line)
+                      build_chat_payload, parse_sse_line, extract_meme_tag)
 
 
 def theme_color(key, fallback):
@@ -4353,7 +4354,7 @@ def paint_starry_bubble(painter, path, rect):
 import meme_store
 from meme_store import (MEME_ROOT, MEME_TAGS, MEME_EXTS, MEME_MAX_H, MEME_MAX_W,
                         MEME_SECONDS, MEME_GAP, MEME_PAD, MEME_REPLY_TAGS,
-                        MEME_REPLY_DELAY_MS, MEME_USER_SECONDS)
+                        MEME_REPLY_DELAY_MS, MEME_USER_SECONDS, search_or_pick_meme)
 _meme_index_cache = meme_store._meme_index_cache
 _meme_pix_cache = meme_store._meme_pix_cache
 
@@ -4376,6 +4377,10 @@ def _meme_items(force=False):
 
 def pick_meme(tag=None):
     return meme_store.pick_meme(tag, root=MEME_ROOT)
+
+
+def search_or_pick_meme(tag=None, keyword=None):
+    return meme_store.search_or_pick_meme(tag=tag, keyword=keyword, root=MEME_ROOT)
 
 
 def _meme_path_ok(path):
@@ -4795,6 +4800,35 @@ def load_json(path, default):
     except Exception:
         return default
 
+def load_chat_history_from_disk(path):
+    """读取本地持久化的聊天历史与 UI 记录：返回 (llm_history, ui_log)。"""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                llm_h = data.get("llm_history") or []
+                ui_l = data.get("ui_log") or []
+                return list(llm_h), list(ui_l)
+    except Exception as exc:
+        chat_debug("加载聊天历史异常: %r" % exc, "WARN")
+    return [], []
+
+
+def save_chat_history_to_disk(path, llm_history, ui_log):
+    """将聊天历史与 UI 记录原子写入磁盘，防止重启时丢失上下文与产生疏离感。"""
+    try:
+        data = {
+            "llm_history": list(llm_history or [])[-CHAT_HISTORY_MAX:],
+            "ui_log": list(ui_log or [])[-100:],
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as exc:
+        chat_debug("保存聊天历史异常: %r" % exc, "WARN")
+
 
 class PetWindow(QWidget):
     # ---------- 城市（联网添加） ----------
@@ -5137,8 +5171,10 @@ class PetWindow(QWidget):
         self._meme_caption = ""
         self._meme_until = 0.0
         self._meme_pressed = False     # 这一下按在表情上（松手不当单击处理）
-        # 本地 LLM 聊天（右键「聊天…」）：后台线程流式取，主线程 tick 里堆字。
-        self._chat_history = []           # 最近 6 轮（12 条），只在内存里，重启清空
+        # 本地 LLM 聊天（右键「聊天…」）：持久化历史 + 流式输出
+        saved_llm_h, saved_ui_log = load_chat_history_from_disk(CHAT_HISTORY_PATH)
+        self._chat_history = saved_llm_h[-CHAT_HISTORY_MAX:]
+        self._chat_ui_log = saved_ui_log[-100:]
         self._chat_queue = queue.Queue()  # 后台线程 → 主线程：(gen, kind, payload)
         self._chat_gen = 0                # 每次发送 +1：旧线程的排队结果直接丢掉
         self._chat_cancel = None          # 当前请求的取消 Event
@@ -5149,7 +5185,6 @@ class PetWindow(QWidget):
         self._chat_busy = False           # 还在等 / 收流（这期间闲着不冒话）
         self._chat_font_pt = None         # 长回复自动缩字号（让气泡不压到身上）
         self._chat_panel = None           # QQ 风聊天面板（打开时创建，非模态）
-        self._chat_ui_log = []            # 面板里的左右聊天记录（只在内存）
         self._chat_ui_typing = False
         # 表情斗图：主人发一张 → 过一会儿她回一张
         self._meme_reply_timer = None
@@ -9905,23 +9940,28 @@ class PetWindow(QWidget):
         return True
 
     def send_meme(self, path, caption="", reply_delay=None):
-        """表情抽屉点了一张：先挂出自己发的，过一会儿按相近情绪回一张（斗图）。
+        """表情抽屉点了一张：接入 AI 根据表情内容回复，同时联动表情包。
 
-        参考 dsh-meme 的一来一回：主人发一张 → 她回一张，面板一直开着。
-        这条只动头顶显示，不进 `_chat_history`，不污染 LLM 上下文。
+        聊天面板里的表情包只在面板内显示，不再往桌宠头顶挂。
         """
         self._meme_reply_cancel()
-        if not self.show_meme_path(path, caption, seconds=MEME_USER_SECONDS):
-            return False
-        self._meme_reply_tag = self._pick_reply_tag(self._meme_tag_of(path))
-        if self._meme_reply_timer is None:
-            self._meme_reply_timer = QTimer(self)
-            self._meme_reply_timer.setSingleShot(True)
-            self._meme_reply_timer.timeout.connect(self._meme_reply_now)
-        delay = MEME_REPLY_DELAY_MS if reply_delay is None else max(0, int(reply_delay))
-        self._meme_reply_timer.start(delay)
-        # 我发的表情只出图，不再把 caption 的"意思"写在图片下面
+        # 1. 聊天面板显示自己发送的表情图片（头顶不再挂出）
         self.chat_ui_add("user", "", image=path)
+
+        # 2. 将表情包的描述信息作为对话内容发送给 AI
+        tag = self._meme_tag_of(path)
+        cap = (caption or "").strip()
+        if cap and tag:
+            prompt = f"[发送了表情包：{tag} - {cap}]"
+        elif cap:
+            prompt = f"[发送了表情包：{cap}]"
+        elif tag:
+            prompt = f"[发送了表情包：{tag}]"
+        else:
+            prompt = "[发送了表情包]"
+
+        # 3. 接入 AI 聊天，由 AI 回复文字 + 联动表情包（面板内已有图片，不重复添加文本框）
+        self.send_chat(prompt, add_to_ui=False)
         return True
 
     def _meme_reply_cancel(self):
@@ -10050,6 +10090,19 @@ class PetWindow(QWidget):
         pm = QPixmap(path) if path else QPixmap()
         return pet_avatar_pixmap(pm, size)
 
+    def _save_chat_history(self):
+        """落盘保存历史对话上下文，消除关机/重启带来的疏离感。"""
+        save_chat_history_to_disk(CHAT_HISTORY_PATH, self._chat_history, self._chat_ui_log)
+
+    def clear_chat_history(self):
+        """清空历史聊天记录与上下文记忆，重新开始新记忆。"""
+        self._chat_history = []
+        self._chat_ui_log = []
+        self._save_chat_history()
+        if self._chat_panel is not None:
+            self._chat_panel.set_log([])
+        self.say("过去的话题我已经封存好啦，让我们开始新的聊天吧～", seconds=2.5, again=True)
+
     def chat_ui_add(self, role, text, image=None):
         """往聊天面板补一条记录（role=user / pet）。面板没开也先存着，打开时补画。"""
         text = str(text or "").strip()
@@ -10060,7 +10113,8 @@ class PetWindow(QWidget):
         if image:
             item["image"] = str(image)
         self._chat_ui_log.append(item)
-        del self._chat_ui_log[:-60]
+        del self._chat_ui_log[:-100]
+        self._save_chat_history()
         if self._chat_panel is not None:
             self._chat_panel.add_message(role, text, image=image)
 
@@ -10095,7 +10149,7 @@ class PetWindow(QWidget):
         if self._chat_panel is not None:
             self._chat_panel.close_panel()
 
-    def send_chat(self, user_text):
+    def send_chat(self, user_text, add_to_ui=True):
         """发一条：先取消上一条，再开后台线程流式请求（UI 线程立刻返回）。"""
         text = str(user_text or "").strip()
         if not text:
@@ -10118,7 +10172,8 @@ class PetWindow(QWidget):
             target=self._chat_worker,
             args=(gen, provider, messages, cancel, text),
             daemon=True).start()
-        self.chat_ui_add("user", text)
+        if add_to_ui:
+            self.chat_ui_add("user", text)
         self.chat_ui_typing(True)
         return True
 
@@ -10234,13 +10289,29 @@ class PetWindow(QWidget):
         if not full:
             self._chat_on_error("模型返回了空内容")
             return
+        clean_text, tag, keyword = extract_meme_tag(full)
         self._chat_history.append({"role": "user", "content": str(user_text)})
-        self._chat_history.append({"role": "assistant", "content": full})
-        del self._chat_history[:-CHAT_HISTORY_MAX]     # 只留最近 6 轮
+        self._chat_history.append({"role": "assistant", "content": clean_text or full})
+        del self._chat_history[:-CHAT_HISTORY_MAX]     # 扩展深层记忆
         self.chat_ui_typing(False)
-        self.chat_ui_add("pet", full)
+        self._save_chat_history()
+
+        # 联动表情包匹配（情绪 + 关键词优先匹配）
+        meme_match = None
+        if tag or keyword:
+            meme_match = search_or_pick_meme(tag=tag, keyword=keyword)
+
+        if meme_match:
+            meme_path, _caption = meme_match
+            # 聊天面板内的表情包只在面板内显示，不再往桌宠头顶挂
+            self.chat_ui_add("pet", clean_text, image=meme_path)
+            chat_debug("聊天回复联动表情包：tag=%s keyword=%s path=%s"
+                       % (tag, keyword, meme_path))
+        else:
+            self.chat_ui_add("pet", clean_text or full)
+
         chat_debug("完成：%d 字，历史 %d 条"
-                   % (len(full), len(self._chat_history)))
+                   % (len(clean_text or full), len(self._chat_history)))
 
     def _chat_on_error(self, reason):
         """连不上 / 非 200 / 解析失败：只在聊天记录里给兜底台词，不占头顶气泡。"""
@@ -13341,6 +13412,7 @@ class PetWindow(QWidget):
                 self._rice_carry_update(snap=True)
 
     def quit_app(self):
+        self._save_chat_history()
         self._meme_reply_cancel()
         self.close_chat_panel()
         self._unregister_hotkeys()        # 全局快捷键要还给系统，不然退出后这个键就废了
