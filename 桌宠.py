@@ -271,7 +271,7 @@ def install_qt_translator(app):
         except Exception:
             pass
 
-BUBBLE_H = 112         # 气泡区高度（要放得下四行余额气泡：余额 / 金额 / 今日已用 / 峰谷）
+BUBBLE_H = 168         # 气泡区高度（2026-10-23 全体放大：原来 112，字号也跟着放大）
 MARGIN = 4
 # 五档。**滑块上的百分比以「大」为 100%**（2026-09-14 定的：选「大」时滑块就停在 100%），
 # 所以这几档特意按"乘出来是整百分数"排：30% / 40% / 60% / 80% / 100%。
@@ -701,7 +701,7 @@ MENU_ICON_CHILD = (
     ("天气", "page.location"),
 )
 LYRIC_MAX_ROWS = 4              # 当前这句最多折几行（再多就先把字号缩一档）
-LYRIC_MIN_PT = 7                # 折行还是超了时，字号最小缩到几磅（只有"迷你档 + 超长英文句"才会用到）
+LYRIC_MIN_PT = 8.5              # 折行还是超了时，字号最小缩到几磅（只有"迷你档 + 超长英文句"才会用到）
 LYRIC_OVERFLOW_ROWS = 8         # 缩到底还装不下时最多铺几行（宁可气泡高一点，也别丢歌词）
 MUSIC_HOLD_SEC = 5.0          # 放歌时：双击看余额 / 点"查看天气"，都显示 5 秒
 MUSIC_PEEK_SEC = MUSIC_HOLD_SEC
@@ -3412,8 +3412,8 @@ CHAT_COMMON_RULES = "\n".join([
     "- 不要自称 AI / 模型 / 助手，也不要解释自己有系统提示",
 ])
 CHAT_REPLY_DISPLAY_MAX = 180         # 头顶气泡塞得下的上限；超出的在历史里保留全文
-CHAT_BUBBLE_H = 240                  # 聊天时气泡区临时加高（窗口往上长，精灵不动）
-CHAT_FONT_PT = 11.5                  # 聊天用大字（不再为了塞字数缩到 8 磅）
+CHAT_BUBBLE_H = 280                  # 聊天时气泡区临时加高（窗口往上长，精灵不动）
+CHAT_FONT_PT = 12.5                  # 聊天用大字（不再为了塞字数缩到 8 磅）
 CHAT_MAX_LINES = 10
 CHAT_HISTORY_ROUNDS = 6              # 只带最近 6 轮
 CHAT_HISTORY_MAX = CHAT_HISTORY_ROUNDS * 2
@@ -6116,6 +6116,7 @@ class PetWindow(QWidget):
             "peak_style": "默认",
             "bubble_style": BUBBLE_STYLE_DEFAULT,   # 气泡风格：星空 / 跟随界面 / 浅色 / 深色
             "bubble_font": BUBBLE_FONT_DEFAULT,     # 气泡字体：楷体 / 雅黑
+            "bubble_layout_v2": False,              # 气泡区 112→168 的那次迁移（y 只补一次）
             "line_freq": LINE_FREQ_DEFAULT,
             "lyric_offset": LYRIC_OFFSET_DEFAULT,
             "layer": "top",
@@ -6623,6 +6624,11 @@ class PetWindow(QWidget):
             screen = QApplication.primaryScreen().availableGeometry()
             x = screen.right() - self.width() - 80
             y = screen.bottom() - self.height() - 60
+        elif not self.cfg.get("bubble_layout_v2"):
+            # 气泡区从 112 涨到 168：窗口变高了，把 y 往上补回 56px，
+            # 精灵在屏幕上的位置保持不变（只补这一次，之后按新坐标存）。
+            self.cfg["bubble_layout_v2"] = True
+            y = int(y) - (BUBBLE_H - 112)
         self.move(int(x), int(y))
         self.show()
         self.snap_into_screen()
@@ -8335,10 +8341,10 @@ class PetWindow(QWidget):
             # 余额气泡：余额 / 今日已用（数字带滚动动画）
             ink = self._bubble_ink()
             f_small = QFont(self.bubble_font)
-            f_small.setPointSize(9)
+            f_small.setPointSize(10.5)
             f_small.setWeight(QFont.Weight.Medium)     # 楷体细，小字给重一点才看得清
             f_big = QFont(self.bubble_font)
-            f_big.setPointSize(15)
+            f_big.setPointSize(17.5)
             f_big.setBold(True)
             fm_s, fm_b = QFontMetrics(f_small), QFontMetrics(f_big)
             src = self.balance.get("name") or "DeepSeek"
@@ -8457,7 +8463,7 @@ class PetWindow(QWidget):
                                 BUBBLE_FONTS[BUBBLE_FONT_DEFAULT])
         f = QFont()
         f.setFamilies(list(spec["families"]))
-        f.setPointSize(11)
+        f.setPointSize(12.5)
         return f
 
     def _bubble_fonts(self, base=10):
@@ -8513,7 +8519,7 @@ class PetWindow(QWidget):
     def _paint_note_bubble(self, p, ink):
         """普通台词气泡：柔和投影 + 细描边 + 圆角小尾巴，行距比原来松一点。"""
         inner = self.bubble_inner
-        f_main, _f_small, _f_tag = self._bubble_fonts(10.5)
+        f_main, _f_small, _f_tag = self._bubble_fonts(12.5)
         if self._chat_font_pt and self._chat_full and self.bubble_text:
             # 聊天回复可能比较长：按 _chat_fit_display() 选好的字号画，气泡不压到身上
             f_main.setPointSizeF(float(self._chat_font_pt))
@@ -8559,7 +8565,7 @@ class PetWindow(QWidget):
         if not self._meme_path:
             return None
         f_cap = QFont(self.bubble_font)
-        f_cap.setPointSize(10)
+        f_cap.setPointSize(11.5)
         f_cap.setWeight(QFont.Weight.Medium)
         f_cap.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
         fm_cap = QFontMetrics(f_cap)
@@ -8624,7 +8630,7 @@ class PetWindow(QWidget):
         opts = card.get("options") or []
         total = int(card.get("total") or 1)
         index = int(card.get("index") or 1)
-        f_q, f_small, f_tag = self._bubble_fonts(9.0)
+        f_q, f_small, f_tag = self._bubble_fonts(10.5)
         f_opt, f_hdr = f_small, f_tag
         fm_h, fm_q, fm_o = QFontMetrics(f_hdr), QFontMetrics(f_q), QFontMetrics(f_opt)
         pad_x, pad_y = 11, 6
@@ -8778,7 +8784,7 @@ class PetWindow(QWidget):
     def _lyric_rows(self, head, cur, nxt, max_w, ink=None):
         """把歌词折成"要画的几行"。
 
-        一句太长就先把字号往下缩（11 → 8 磅）；缩到底还超才截到 LYRIC_MAX_ROWS 行 ——
+        一句太长就先把字号往下缩（12.5 → 8.5 磅）；缩到底还超才截到 LYRIC_MAX_ROWS 行 ——
         主人反馈过"歌词显示不全"，所以尽量别丢掉半句话。
         ink 是当前气泡那套颜色（见 _bubble_ink）—— 颜色烘在结果里，换风格要连带重算。
         不给就按现在生效的那套来（老用例只关心折行，不传这个参数）。
@@ -8787,10 +8793,10 @@ class PetWindow(QWidget):
         if ink is None:
             ink = self._bubble_ink()
         f_small = QFont(self.bubble_font)
-        f_small.setPointSize(9)
+        f_small.setPointSize(10.5)
         f_small.setWeight(QFont.Weight.Medium)         # 楷体细，小字给重一点才看得清
         f_main = QFont(self.bubble_font)
-        f_main.setPointSize(11)
+        f_main.setPointSize(12.5)
         # 顶行右边那条要留给 ⏮ ⏸▶ ⏭（见 LYRIC_BTN_PAD），**只有第一行窄**：
         # 折到第二行起整行都能用。一行塞不下就折两行；两行还塞不下才丢"——歌手"，
         # 最后才省略 —— 以前是"只取第一行"，歌手甚至歌名会无声无息地消失。
@@ -8812,10 +8818,10 @@ class PetWindow(QWidget):
                     head_lines[_i + 1] = _sep + " " + head_lines[_i + 1]
                     break
         cur_lines = wrap_text(QFontMetrics(f_main), cur, max_w)
-        pt = 11
+        pt = 12.5
         while len(cur_lines) > LYRIC_MAX_ROWS and pt > LYRIC_MIN_PT:
             pt -= 1
-            f_main.setPointSize(pt)
+            f_main.setPointSizeF(pt)
             cur_lines = wrap_text(QFontMetrics(f_main), cur, max_w)
         total = len(cur_lines)
         fm_m = QFontMetrics(f_main)
