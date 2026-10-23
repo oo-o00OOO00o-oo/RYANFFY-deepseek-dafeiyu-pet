@@ -75,7 +75,7 @@ pyinstaller --noconfirm --clean 桌宠.spec
 
 | 文件 | 作用 |
 | --- | --- |
-| `桌宠.py` | 主程序，单文件，体量很大（27 万字符级别），改前先定位到具体类/方法 |
+| `桌宠.py` | 主程序，体量大（约 1.15 万行），改前先定位到具体类/方法；聊天相关拆在 `chat_ui.py` / `llm_chat.py` / `meme_store.py` |
 | `config.json` | 运行时配置，**已被 .gitignore 忽略**，不要提交、不要当源码改 |
 | `sprites/` `assets/` | 形象贴图与音效素材 |
 | `桌宠.spec` `installer.iss` | PyInstaller / Inno Setup 打包脚本 |

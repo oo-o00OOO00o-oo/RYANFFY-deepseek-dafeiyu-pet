@@ -403,8 +403,11 @@ PyInstaller 把本机其它运行时里的 ICU（`icuuc.dll` / `icudt*.dll`）�
 
 | 文件 | 说明 |
 |------|------|
-| 桌宠.py | 主程序（全部逻辑） |
+| 桌宠.py | 主程序（桌宠本体：动画 / 气泡 / 余额 / 歌词 / 金币 / 饭碗） |
 | ui_console.py | 设置窗口（主题 / 图标 / 12 个分类页） |
+| llm_chat.py | 本地 LLM 聊天的纯逻辑（provider / 人设 / SSE / 流式） |
+| meme_store.py | 表情包图库只读索引（meme-packs / 按 tag 抽图 / 缩放缓存） |
+| chat_ui.py | 聊天面板 + 表情抽屉（左右气泡 / 头像 / 格子池 / 搜索筛选） |
 | preprocess.py | 白底三视图抠图脚本 |
 | preprocess2.py | 精灵边缘去污 + 多尺寸生成脚本 |
 | sprites/ | 精灵图（正面/侧面/背面 各尺寸 + 图标） |
