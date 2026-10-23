@@ -7,7 +7,9 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('sprites', 'sprites'), ('assets', 'assets')]
 binaries = []
-hiddenimports = []
+# 2026-10-23 把 桌宠.py 按功能拆成几个本地模块：显式列出来，
+# 免得 PyInstaller 只盯着入口文件漏收。
+hiddenimports = ['llm_chat', 'meme_store', 'chat_ui', 'ui_console']
 tmp_ret = collect_all('requests')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

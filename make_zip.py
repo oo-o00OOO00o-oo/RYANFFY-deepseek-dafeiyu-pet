@@ -11,7 +11,8 @@ import zipfile
 BASE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("BIGFISH_ZIP_OUT") or os.path.join(os.path.dirname(BASE), "大肥鱼桌宠_源码.zip")
 
-files = ["桌宠.py", "preprocess.py", "preprocess2.py", "启动桌宠.bat",
+files = ["桌宠.py", "ui_console.py", "llm_chat.py", "meme_store.py",
+         "chat_ui.py", "preprocess.py", "preprocess2.py", "启动桌宠.bat",
          "requirements.txt", "README.md", "LICENSE", "icon.ico", ".gitignore"]
 for root, dirs, fs in os.walk(os.path.join(BASE, "sprites")):
     for f in fs:
