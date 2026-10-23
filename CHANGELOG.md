@@ -2,10 +2,26 @@
 
 ## v1.1.6（未发布）
 
-### 聊天面板修整：表情缩略图 / 可拖动 / 不跳位 / 不占头顶气泡 / 滚动更顺
+### 聊天面板修整：表情缩略图 / 可拖动 / 不跳位 / 不占头顶气泡 / 滚动更顺 / 背景不透
 
 - 表情抽屉的缩略图恢复正常：拆模块时 `QImageReader` / `QImage` 没带进 `chat_ui.py`，
   解码异常被吞掉，所有格子都显示成「?」；补上 import 后 25 张可见图都能出来。
+- 修复聊天面板背景镂空、能直接看到后面 VS Code 的问题：
+  `ChatPanel` 本身设置了 `WA_TranslucentBackground`（用于圆角抗锯齿），但 `paintEvent`
+  只在阴影范围内填渐变，窗口边缘/圆角外侧没有实色底，于是透出桌面。
+  现在在 `paintEvent` 开头先铺一层主题实色底（星空 `#0E122C` / 浅色 `#F8FAFF`，alpha=255），
+  覆盖整个窗口圆角区域，再在上面画阴影和渐变。
+- 修复聊天面板被设置窗口背景图（`console_bg_path`）整张铺满、聊天记录被衬花的问题：
+  `_draw_custom_backdrop()` 不再 fallback 到 `console_bg_path`，只认专属的 `chat_bg_path`；
+  且即使有 `chat_bg_path`，也只在标题区以 15% 透明度淡淡叠一层，不覆盖聊天记录区域。
+- 真正修好聊天记录区 / 表情抽屉的镂空：
+  - 根因不是面板渐变没铺满，而是 `_log_body` 设了 `WA_OpaquePaintEvent=True`，
+    但 body 只画消息行，空白区域 alpha 仍是 0；透明顶层窗口就把后面的 DSH / 桌面透出来。
+  - 现在 body 关闭 `WA_OpaquePaintEvent`，viewport / body 用主题色实色样式
+    （星空 `#0C0F26` / 浅色 `#F8FAFC`）；聊天区换成自定义 `OpaqueViewport`，
+    每次 paintEvent 先填实色。
+  - 表情抽屉同样处理：`OpaqueScrollArea` + `gridHolder` / 网格自身填主题色，
+    格子之间的空隙不再透出桌面。
 - 聊天窗口可以按住标题区拖动；拖过之后不再自动跟着桌宠跑（重开面板恢复跟随）。
 - 点 😊 展开表情抽屉时保持面板顶部，不再因为"下面放不下"突然翻到桌宠下方。
 - 聊天内容只进聊天面板：头顶气泡不再出现「嗯…我想想」、回复正文、兜底台词或断线提示。
@@ -14,7 +30,7 @@
 - 我发的表情只显示图片，不再在图片下面写它的 caption 解释；她回的仍带 caption。
 - 界面继续向 `modern_chat_interface.html` 靠：标题头像 + 「桌面小鲸鱼」身份小牌、
   「今天」分割线、每条消息下面有时间（HH:MM）。
-- 实测：`_work/test_meme_picker.py` **98 项**、`_work/test_chat.py` **71 项**、
+- 实测：`_work/test_meme_picker.py` **95 项**、`_work/test_chat.py` **72 项**、
   `_work/test_meme.py` **55 项**全过；真机 `_work/probe_qq_panel.py` **15 项**全过
   （含缩略图非空、拖动、展开不跳位、聊天不进气泡、我发表情无 caption）。
 - 回归：test_anim 73、test_idle_mode 90、test_coin_cry 67、test_dance 35、

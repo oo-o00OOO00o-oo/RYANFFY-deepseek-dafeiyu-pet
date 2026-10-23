@@ -12,6 +12,27 @@
 - **表情格子显示成「?」**：拆分 `chat_ui.py` 时漏了 `QImageReader` / `QImage` 两个 import，
   `MemeThumbCache._decode()` 抛 `NameError` 被 `except Exception` 吞掉，全部返回 None。
   已补 import，并在 `test_meme_picker` 加「格子缩略图真的解码出来了（不是 ?）」断言。
+- **聊天面板背景镂空 / 被背景图铺满**：用户截图显示整个面板透明、能看到后面的 VS Code；
+  另一张截图显示设置窗口的背景图被铺满了聊天面板，聊天记录被衬花。
+  根因有两个：
+  1. `WA_TranslucentBackground` 后 `paintEvent` 只画了带 padding 的内部渐变，
+     窗口边缘和圆角外侧没有不透明底，于是透出桌面。
+  2. `_draw_custom_backdrop()` 把 `console_bg_path`（设置窗口背景）当成聊天背景，
+     用 35% 透明度铺满整个面板。
+  修复：
+  - 在 `paintEvent` 开头先铺主题实色底（星空 `QColor(14, 18, 44, 255)` /
+    浅色 `QColor(248, 250, 255, 255)`），覆盖整个 `self.rect()` 圆角区域；
+    同时显式 `setWindowOpacity(1.0)` 排除窗口级透明。
+  - `_draw_custom_backdrop()` 不再读 `console_bg_path`，只读 `chat_bg_path`；
+    即使 `chat_bg_path` 存在也只画在标题区、15% 透明度，不盖聊天记录。
+  - 聊天记录区真正根因（2026-10-23 复现确认）：`_log_body` 设了
+    `WA_OpaquePaintEvent=True`，但 body 只画消息行；空白区域 alpha=0，透明窗口
+    就把后面的 DSH/桌面透出来。修复：body 关闭 `WA_OpaquePaintEvent`，
+    viewport / body 用主题色实色样式（星空 `#0C0F26` / 浅色 `#F8FAFC`），
+    并用自定义 `OpaqueViewport` 每次 paintEvent 先填实色。
+  - 表情抽屉同样处理：抽屉滚动区用 `OpaqueScrollArea`，`gridHolder` 和网格自身
+    填主题色，格子空隙不再透桌面。
+  - 真机截图验证（星空/浅色两种主题、聊天区/抽屉）均不再透出 DSH 窗口。
 - **面板拖动**：`ChatPanel` 标题区（y ≤ 58）按下拖动，`_pinned=True`；
   `tick_follow()` 对 pinned 不再 `_place`，重开面板清掉 pinned。标题/头像/身份牌设
   `WA_TransparentForMouseEvents`，事件落到面板本身。
